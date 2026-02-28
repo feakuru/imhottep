@@ -724,3 +724,158 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    // ── count_wrapped_lines ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_count_wrapped_lines_empty_string() {
+        // An empty string has zero logical lines, so sum is 0
+        assert_eq!(count_wrapped_lines("", 80), 0);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_single_short_line() {
+        assert_eq!(count_wrapped_lines("hello", 80), 1);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_exactly_fits() {
+        // 10 chars, width 10 → 1 row
+        assert_eq!(count_wrapped_lines("1234567890", 10), 1);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_wraps_to_two_rows() {
+        // 11 chars in a width-10 box → 2 rows
+        assert_eq!(count_wrapped_lines("12345678901", 10), 2);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_empty_physical_line_counts_as_one() {
+        // str::lines() treats a trailing newline as the end of the single preceding
+        // empty line, so "\n" produces exactly 1 row.
+        let text = "\n";
+        assert_eq!(count_wrapped_lines(text, 80), 1);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_two_newlines_give_two_lines() {
+        // Two logical lines separated by a newline
+        let text = "a\nb";
+        assert_eq!(count_wrapped_lines(text, 80), 2);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_multiple_short_lines() {
+        let text = "line1\nline2\nline3";
+        assert_eq!(count_wrapped_lines(text, 80), 3);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_long_line_wraps_multiple_times() {
+        // 30 chars, width 10 → 3 rows
+        let text = "a".repeat(30);
+        assert_eq!(count_wrapped_lines(&text, 10), 3);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines_mixed_long_and_short() {
+        // 20-char line (2 rows at width 10) + 5-char line (1 row)
+        let text = format!("{}\n{}", "x".repeat(20), "short");
+        assert_eq!(count_wrapped_lines(&text, 10), 3);
+    }
+
+    // ── centered_rect ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_centered_rect_is_within_parent() {
+        let parent = Rect::new(0, 0, 100, 50);
+        let result = centered_rect(60, 25, parent);
+        assert!(result.x >= parent.x);
+        assert!(result.y >= parent.y);
+        assert!(result.x + result.width <= parent.x + parent.width);
+        assert!(result.y + result.height <= parent.y + parent.height);
+    }
+
+    #[test]
+    fn test_centered_rect_width_is_proportional() {
+        let parent = Rect::new(0, 0, 100, 100);
+        let result = centered_rect(60, 50, parent);
+        // 60% of 100 = 60; ratatui layout may round, allow ±2
+        assert!(
+            (result.width as i32 - 60).abs() <= 2,
+            "width was {}",
+            result.width
+        );
+    }
+
+    #[test]
+    fn test_centered_rect_height_is_proportional() {
+        let parent = Rect::new(0, 0, 100, 100);
+        let result = centered_rect(60, 50, parent);
+        assert!(
+            (result.height as i32 - 50).abs() <= 2,
+            "height was {}",
+            result.height
+        );
+    }
+
+    #[test]
+    fn test_centered_rect_is_horizontally_centered() {
+        let parent = Rect::new(0, 0, 100, 100);
+        let result = centered_rect(60, 50, parent);
+        let left_margin = result.x;
+        let right_margin = parent.width - result.x - result.width;
+        // Margins should be roughly equal (rounding may differ by 1)
+        assert!(
+            (left_margin as i32 - right_margin as i32).abs() <= 1,
+            "left={left_margin} right={right_margin}"
+        );
+    }
+
+    #[test]
+    fn test_centered_rect_full_size() {
+        let parent = Rect::new(0, 0, 80, 40);
+        let result = centered_rect(100, 100, parent);
+        // 100% → entire area (ratatui may leave 0 for the margin percentages)
+        assert!(result.width > 0);
+        assert!(result.height > 0);
+    }
+
+    // ── focused_border_style ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_focused_border_style_when_focused_is_cyan() {
+        let style = focused_border_style(true);
+        assert_eq!(style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn test_focused_border_style_when_not_focused_is_default() {
+        let style = focused_border_style(false);
+        // Default style has no foreground colour set
+        assert_eq!(style.fg, None);
+    }
+
+    // ── selected_item_style ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_selected_item_style_colors() {
+        let style = selected_item_style();
+        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.bg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn test_selected_item_style_is_bold() {
+        let style = selected_item_style();
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+}
