@@ -285,19 +285,19 @@ impl App {
         self.focused_field = match self.focused_field {
             FocusableField::Url => FocusableField::Headers,
             FocusableField::Headers => FocusableField::Body,
-            FocusableField::Body => FocusableField::RequestEvents,
-            FocusableField::RequestEvents => FocusableField::Response,
-            FocusableField::Response => FocusableField::Url,
+            FocusableField::Body => FocusableField::Response,
+            FocusableField::Response => FocusableField::RequestEvents,
+            FocusableField::RequestEvents => FocusableField::Url,
         };
     }
 
     pub fn focus_previous_field(&mut self) {
         self.focused_field = match self.focused_field {
-            FocusableField::Url => FocusableField::Response,
+            FocusableField::Url => FocusableField::RequestEvents,
             FocusableField::Headers => FocusableField::Url,
             FocusableField::Body => FocusableField::Headers,
-            FocusableField::RequestEvents => FocusableField::Body,
-            FocusableField::Response => FocusableField::RequestEvents,
+            FocusableField::Response => FocusableField::Body,
+            FocusableField::RequestEvents => FocusableField::Response,
         };
     }
 
