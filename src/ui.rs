@@ -134,24 +134,18 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(5),
         ])
         .split(frame.area());
 
     let title_block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
+        .title_top(Line::from("ImHoTTeP").centered())
         .style(Style::default());
 
-    let title = Paragraph::new(Text::styled(
-        "= ImHoTTeP =",
-        Style::default().fg(Color::Green),
-    ))
-    .centered()
-    .block(title_block);
-
-    frame.render_widget(title, chunks[0]);
+    frame.render_widget(title_block, chunks[0]);
 
     match app.current_screen {
         CurrentScreen::Main => render_main_screen(frame, app, chunks[1]),
