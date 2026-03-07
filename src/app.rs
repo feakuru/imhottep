@@ -79,7 +79,7 @@ pub struct App {
 
 impl App {
     pub fn new() -> App {
-        let requests = load_requests().unwrap_or_default();
+        let requests = load_requests_from_dir(None).unwrap_or_default();
         let current_request_index = if requests.is_empty() { None } else { Some(0) };
         App {
             current_screen: CurrentScreen::Main,
@@ -516,7 +516,7 @@ impl App {
     }
 
     pub fn save_requests(&mut self) {
-        match save_requests(&self.requests) {
+        match save_requests_to_dir(&self.requests, None) {
             Ok(path) => {
                 self.last_save_status = Some(format!("Saved to {}", path.display()));
             }
@@ -529,22 +529,28 @@ impl App {
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-fn library_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                let mut p = PathBuf::from(h);
-                p.push(".config");
-                p
+fn library_path_with_base(base_override: Option<&std::path::Path>) -> PathBuf {
+    let base = match base_override {
+        Some(provided_base) => provided_base.to_path_buf(),
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| {
+                    let mut p = PathBuf::from(h);
+                    p.push(".config");
+                    p
+                })
             })
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+
     base.join("imhottep").join("request-library.json")
 }
 
-pub fn load_requests() -> Result<Vec<HttpRequest>, Box<dyn std::error::Error>> {
-    let path = library_path();
+pub fn load_requests_from_dir(
+    base: Option<&std::path::Path>,
+) -> Result<Vec<HttpRequest>, Box<dyn std::error::Error>> {
+    let path = library_path_with_base(base);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -553,8 +559,11 @@ pub fn load_requests() -> Result<Vec<HttpRequest>, Box<dyn std::error::Error>> {
     Ok(requests)
 }
 
-pub fn save_requests(requests: &[HttpRequest]) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let path = library_path();
+pub fn save_requests_to_dir(
+    requests: &[HttpRequest],
+    base: Option<&std::path::Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = library_path_with_base(base);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -891,8 +900,8 @@ mod tests {
         let expected = [
             FocusableField::Headers,
             FocusableField::Body,
-            FocusableField::RequestEvents,
             FocusableField::Response,
+            FocusableField::RequestEvents,
             FocusableField::Url, // wraps back
         ];
         for &field in &expected {
@@ -907,8 +916,8 @@ mod tests {
         app.focused_field = FocusableField::Url;
 
         let expected = [
-            FocusableField::Response,
             FocusableField::RequestEvents,
+            FocusableField::Response,
             FocusableField::Body,
             FocusableField::Headers,
             FocusableField::Url, // wraps back
@@ -1376,15 +1385,10 @@ mod tests {
 
     #[test]
     fn test_save_and_load_requests_round_trip() {
-        use std::env;
         use tempfile::TempDir;
 
         let dir = TempDir::new().expect("tempdir");
-        // Point XDG_CONFIG_HOME at the temp dir so library_path() writes there
-        // SAFETY: test-only, single-threaded; no other threads read this var concurrently.
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
+        let base = dir.path();
 
         let requests = vec![
             HttpRequest::new(HttpMethod::GET, "https://save-test.com".to_string()),
@@ -1392,85 +1396,59 @@ mod tests {
                 .with_body("payload".to_string()),
         ];
 
-        save_requests(&requests).expect("save failed");
-        let loaded = load_requests().expect("load failed");
+        save_requests_to_dir(&requests, Some(base)).expect("save failed");
+        let loaded = load_requests_from_dir(Some(base)).expect("load failed");
 
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].method, HttpMethod::GET);
         assert_eq!(loaded[0].url, "https://save-test.com");
         assert_eq!(loaded[1].method, HttpMethod::POST);
         assert_eq!(loaded[1].body, Some("payload".to_string()));
-
-        // Restore env to avoid test pollution
-        unsafe {
-            env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     #[test]
     fn test_load_requests_returns_empty_when_file_absent() {
-        use std::env;
         use tempfile::TempDir;
 
         let dir = TempDir::new().expect("tempdir");
-        // SAFETY: test-only, single-threaded.
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
+        let base = dir.path();
 
-        let loaded = load_requests().expect("should return Ok(vec![])");
+        let loaded = load_requests_from_dir(Some(base)).expect("should return Ok(vec![])");
         assert!(loaded.is_empty());
-
-        unsafe {
-            env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     #[test]
     fn test_save_requests_creates_parent_directories() {
-        use std::env;
         use tempfile::TempDir;
 
         let dir = TempDir::new().expect("tempdir");
-        // SAFETY: test-only, single-threaded.
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
+        let base = dir.path();
 
         let requests = vec![make_get("https://mkdir-test.com")];
-        let path = save_requests(&requests).expect("save failed");
+        let path = save_requests_to_dir(&requests, Some(base)).expect("save failed");
         assert!(path.exists(), "library file was not created");
-
-        unsafe {
-            env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     #[test]
     fn test_save_requests_overwrites_on_second_call() {
-        use std::env;
         use tempfile::TempDir;
 
         let dir = TempDir::new().expect("tempdir");
-        // SAFETY: test-only, single-threaded.
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
+        let base = dir.path();
 
-        save_requests(&[make_get("https://first.com")]).expect("first save");
-        save_requests(&[
-            make_get("https://second.com"),
-            make_get("https://third.com"),
-        ])
+        save_requests_to_dir(&[make_get("https://first.com")], Some(base)).expect("first save");
+        save_requests_to_dir(
+            &[
+                make_get("https://second.com"),
+                make_get("https://third.com"),
+            ],
+            Some(base),
+        )
         .expect("second save");
 
-        let loaded = load_requests().expect("load");
+        let loaded = load_requests_from_dir(Some(base)).expect("load");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].url, "https://second.com");
-
-        unsafe {
-            env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     // ── fuzzy_match (module-private, tested via get_filtered_header_suggestions)
