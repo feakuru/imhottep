@@ -283,7 +283,7 @@ where
                                 if app.focused_field == FocusableField::Headers {
                                     app.select_next_header();
                                 } else {
-                                    app.scroll_down();
+                                    app.scroll_down(1);
                                 }
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
@@ -291,7 +291,23 @@ where
                                 if app.focused_field == FocusableField::Headers {
                                     app.select_previous_header();
                                 } else {
-                                    app.scroll_up();
+                                    app.scroll_up(1);
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                // If focused on headers, navigate header list
+                                if app.focused_field == FocusableField::Headers {
+                                    app.select_next_header();
+                                } else {
+                                    app.scroll_down(30);
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                // If focused on headers, navigate header list
+                                if app.focused_field == FocusableField::Headers {
+                                    app.select_previous_header();
+                                } else {
+                                    app.scroll_up(30);
                                 }
                             }
                             KeyCode::Char('a') => {

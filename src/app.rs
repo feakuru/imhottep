@@ -50,6 +50,7 @@ pub struct App {
         Option<oneshot::Receiver<Result<HttpResponse, crate::http_client::HttpError>>>,
     pub event_receiver: Option<mpsc::UnboundedReceiver<RequestEvent>>,
     pub request_events: Vec<String>,
+    pub streamed_body: String,
     pub last_response: Option<Result<HttpResponse, String>>,
     pub http_runtime: HttpRuntime,
     pub editing_field: Option<EditingField>,
@@ -105,6 +106,7 @@ impl App {
             body_scroll: 0,
             events_scroll: 0,
             response_scroll: 0,
+            streamed_body: String::new(),
             last_save_status: None,
         }
     }
@@ -166,6 +168,7 @@ impl App {
             self.pending_response = Some(result_rx);
             self.event_receiver = Some(event_rx);
             self.request_events.clear();
+            self.streamed_body.clear();
             self.last_response = None;
         }
     }
@@ -174,7 +177,16 @@ impl App {
         if let Some(receiver) = &mut self.pending_response {
             match receiver.try_recv() {
                 Ok(result) => {
-                    self.last_response = Some(result.map_err(|e| e.to_string()));
+                    // Move the result into last_response and also populate streamed_body
+                    match result {
+                        Ok(resp) => {
+                            self.streamed_body = resp.body.clone();
+                            self.last_response = Some(Ok(resp));
+                        }
+                        Err(e) => {
+                            self.last_response = Some(Err(e.to_string()));
+                        }
+                    }
                     self.pending_response = None;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -193,7 +205,17 @@ impl App {
         if let Some(receiver) = &mut self.event_receiver {
             // Drain all available events
             while let Ok(event) = receiver.try_recv() {
-                self.request_events.push(event.to_string());
+                match event {
+                    crate::http_client::RequestEvent::BodyChunk(s) => {
+                        // Append chunk to streamed buffer (lossy UTF-8 already on sender)
+                        self.streamed_body.push_str(&s);
+                        self.request_events
+                            .push(format!("Response chunk received: {} bytes", s.len()));
+                    }
+                    other => {
+                        self.request_events.push(other.to_string());
+                    }
+                }
                 received_any = true;
             }
         }
@@ -403,33 +425,15 @@ impl App {
         }
     }
 
-    pub fn scroll_up(&mut self) {
+    pub fn scroll_up(&mut self, by: u16) {
         if let Some(scroll) = self.focused_scroll() {
-            *scroll = scroll.saturating_sub(1);
+            *scroll = scroll.saturating_sub(by);
         }
     }
 
-    pub fn scroll_down(&mut self) {
+    pub fn scroll_down(&mut self, by: u16) {
         if let Some(scroll) = self.focused_scroll() {
-            *scroll = scroll.saturating_add(1);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn clamp_scroll(&mut self, max_scroll: u16) {
-        if let Some(scroll) = self.focused_scroll() {
-            *scroll = (*scroll).min(max_scroll);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn reset_scroll_for_field(&mut self, field: FocusableField) {
-        match field {
-            FocusableField::Headers => self.headers_scroll = 0,
-            FocusableField::Body => self.body_scroll = 0,
-            FocusableField::RequestEvents => self.events_scroll = 0,
-            FocusableField::Response => self.response_scroll = 0,
-            FocusableField::Url => {}
+            *scroll = scroll.saturating_add(by);
         }
     }
 
@@ -690,6 +694,7 @@ mod tests {
             body_scroll: 0,
             events_scroll: 0,
             response_scroll: 0,
+            streamed_body: String::new(),
             last_save_status: None,
         }
     }
@@ -971,10 +976,10 @@ mod tests {
     fn test_scroll_down_increments_focused_field() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         app.focused_field = FocusableField::Body;
-        app.scroll_down();
+        app.scroll_down(1);
         assert_eq!(app.body_scroll, 1);
-        app.scroll_down();
-        assert_eq!(app.body_scroll, 2);
+        app.scroll_down(2);
+        assert_eq!(app.body_scroll, 3);
     }
 
     #[test]
@@ -982,13 +987,12 @@ mod tests {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         app.focused_field = FocusableField::Response;
         app.response_scroll = 3;
-        app.scroll_up();
+        app.scroll_up(1);
         assert_eq!(app.response_scroll, 2);
-        app.scroll_up();
-        app.scroll_up();
+        app.scroll_up(2);
         assert_eq!(app.response_scroll, 0);
         // Saturating — must not underflow
-        app.scroll_up();
+        app.scroll_up(1);
         assert_eq!(app.response_scroll, 0);
     }
 
@@ -996,8 +1000,8 @@ mod tests {
     fn test_scroll_url_field_is_noop() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         app.focused_field = FocusableField::Url;
-        app.scroll_down();
-        app.scroll_up();
+        app.scroll_down(1);
+        app.scroll_up(1);
         // No scroll state for Url — nothing to assert except no panic
     }
 
@@ -1006,16 +1010,13 @@ mod tests {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
 
         app.focused_field = FocusableField::Body;
-        app.scroll_down();
-        app.scroll_down();
+        app.scroll_down(2);
 
         app.focused_field = FocusableField::RequestEvents;
-        app.scroll_down();
+        app.scroll_down(1);
 
         app.focused_field = FocusableField::Response;
-        app.scroll_down();
-        app.scroll_down();
-        app.scroll_down();
+        app.scroll_down(3);
 
         assert_eq!(app.body_scroll, 2);
         assert_eq!(app.events_scroll, 1);
@@ -1289,7 +1290,7 @@ mod tests {
         app.event_receiver = Some(rx);
 
         tx.send(crate::http_client::RequestEvent::Started).unwrap();
-        tx.send(crate::http_client::RequestEvent::Completed)
+        tx.send(crate::http_client::RequestEvent::Completed(20))
             .unwrap();
 
         let received = app.check_for_events();

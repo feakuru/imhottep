@@ -525,7 +525,12 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         // Plain text mode (or pending / no response)
         let response_text = if app.pending_response.is_some() {
-            "Sending request...".to_string()
+            // Render live streamed content as it arrives. If nothing yet, show a hint.
+            if app.streamed_body.is_empty() {
+                "Receiving response...".to_string()
+            } else {
+                app.streamed_body.clone()
+            }
         } else if let Some(ref result) = app.last_response {
             match result {
                 Ok(response) => response.body.clone(),

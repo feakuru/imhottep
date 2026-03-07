@@ -40,8 +40,9 @@ pub enum RequestEvent {
     WaitingForResponse,
     ReceivingHeaders,
     HeadersReceived(u16), // status code
-    ReceivingBody(usize), // bytes received so far
-    Completed,
+    BodyChunk(String),
+    Completed(usize),
+    TemporaryConnectionProblem(String),
     Failed(String),
 }
 
@@ -61,8 +62,11 @@ impl fmt::Display for RequestEvent {
             RequestEvent::HeadersReceived(status) => {
                 write!(f, "Headers received (Status: {})", status)
             }
-            RequestEvent::ReceivingBody(bytes) => write!(f, "Receiving body ({} bytes)", bytes),
-            RequestEvent::Completed => write!(f, "Request completed"),
+            RequestEvent::BodyChunk(s) => write!(f, "Body chunk ({} bytes)", s.len()),
+            RequestEvent::Completed(sz) => write!(f, "Request completed: {} total bytes", sz),
+            RequestEvent::TemporaryConnectionProblem(s) => {
+                write!(f, "Temporary issue with connection: {}", s)
+            }
             RequestEvent::Failed(err) => write!(f, "Request failed: {}", err),
         }
     }
@@ -264,7 +268,7 @@ impl HttpClient {
 
     async fn parse_response(
         &self,
-        response: Response<Incoming>,
+        mut response: Response<Incoming>,
         event_tx: Option<mpsc::UnboundedSender<RequestEvent>>,
     ) -> Result<HttpResponse, HttpError> {
         let tx = &event_tx;
@@ -283,27 +287,36 @@ impl HttpClient {
             }
         }
 
-        // Read body
-        send_event(tx, RequestEvent::ReceivingBody(0));
+        // Stream the body
+        let mut accumulated_body = String::new();
 
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| fail(tx, e.to_string(), HttpError::ResponseParseError))?
-            .to_bytes();
-
-        send_event(tx, RequestEvent::ReceivingBody(body_bytes.len()));
-
-        let body = String::from_utf8_lossy(&body_bytes).into_owned();
-
-        send_event(tx, RequestEvent::Completed);
+        while let Some(next) = response.frame().await {
+            match next {
+                Ok(frame) => {
+                    if let Some(chunk) = frame.data_ref() {
+                        // Convert chunk to string lossily so UI can render incrementally
+                        let chunk_str = String::from_utf8_lossy(chunk).into_owned();
+                        accumulated_body = accumulated_body + &chunk_str;
+                        send_event(tx, RequestEvent::BodyChunk(chunk_str));
+                    }
+                }
+                Err(_) => {
+                    send_event(
+                        tx,
+                        RequestEvent::TemporaryConnectionProblem(
+                            "Could not receive response chunk".into(),
+                        ),
+                    );
+                }
+            }
+        }
+        send_event(tx, RequestEvent::Completed(accumulated_body.bytes().len()));
 
         Ok(HttpResponse {
             status: status_code,
             status_text,
             headers,
-            body,
+            body: accumulated_body,
         })
     }
 }
@@ -511,8 +524,7 @@ mod tests {
         ] {
             let req = HttpRequest::new(method.clone(), "https://example.com".to_string());
             let json = serde_json::to_string(&req).expect("serialization failed");
-            let decoded: HttpRequest =
-                serde_json::from_str(&json).expect("deserialization failed");
+            let decoded: HttpRequest = serde_json::from_str(&json).expect("deserialization failed");
             assert_eq!(decoded.method, method);
         }
     }
@@ -522,7 +534,10 @@ mod tests {
         let req = HttpRequest::new(HttpMethod::DELETE, "https://example.com".to_string());
         let json = serde_json::to_string(&req).expect("serialization failed");
         // The method must appear as a plain string in the JSON
-        assert!(json.contains("\"DELETE\""), "expected plain string method in JSON: {json}");
+        assert!(
+            json.contains("\"DELETE\""),
+            "expected plain string method in JSON: {json}"
+        );
     }
 
     #[test]
@@ -580,36 +595,68 @@ mod tests {
     #[test]
     fn test_http_response_status_boundary_values() {
         // 2xx boundaries
-        let r199 = HttpResponse { status: 199, status_text: String::new(), headers: HashMap::new(), body: String::new() };
+        let r199 = HttpResponse {
+            status: 199,
+            status_text: String::new(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
         assert!(!r199.is_success());
 
-        let r200 = HttpResponse { status: 200, ..r199.clone() };
+        let r200 = HttpResponse {
+            status: 200,
+            ..r199.clone()
+        };
         assert!(r200.is_success());
 
-        let r299 = HttpResponse { status: 299, ..r199.clone() };
+        let r299 = HttpResponse {
+            status: 299,
+            ..r199.clone()
+        };
         assert!(r299.is_success());
 
-        let r300 = HttpResponse { status: 300, ..r199.clone() };
+        let r300 = HttpResponse {
+            status: 300,
+            ..r199.clone()
+        };
         assert!(!r300.is_success());
 
         // 4xx boundaries
-        let r399 = HttpResponse { status: 399, ..r199.clone() };
+        let r399 = HttpResponse {
+            status: 399,
+            ..r199.clone()
+        };
         assert!(!r399.is_client_error());
 
-        let r400 = HttpResponse { status: 400, ..r199.clone() };
+        let r400 = HttpResponse {
+            status: 400,
+            ..r199.clone()
+        };
         assert!(r400.is_client_error());
 
-        let r499 = HttpResponse { status: 499, ..r199.clone() };
+        let r499 = HttpResponse {
+            status: 499,
+            ..r199.clone()
+        };
         assert!(r499.is_client_error());
 
-        let r500 = HttpResponse { status: 500, ..r199.clone() };
+        let r500 = HttpResponse {
+            status: 500,
+            ..r199.clone()
+        };
         assert!(!r500.is_client_error());
         assert!(r500.is_server_error());
 
-        let r599 = HttpResponse { status: 599, ..r199.clone() };
+        let r599 = HttpResponse {
+            status: 599,
+            ..r199.clone()
+        };
         assert!(r599.is_server_error());
 
-        let r600 = HttpResponse { status: 600, ..r199 };
+        let r600 = HttpResponse {
+            status: 600,
+            ..r199
+        };
         assert!(!r600.is_server_error());
     }
 
@@ -617,24 +664,37 @@ mod tests {
     fn test_http_response_all_status_categories_are_mutually_exclusive_for_common_codes() {
         let codes_and_expected: &[(u16, bool, bool, bool)] = &[
             // (status, is_success, is_client_error, is_server_error)
-            (200, true,  false, false),
-            (201, true,  false, false),
-            (204, true,  false, false),
+            (200, true, false, false),
+            (201, true, false, false),
+            (204, true, false, false),
             (301, false, false, false),
-            (400, false, true,  false),
-            (401, false, true,  false),
-            (403, false, true,  false),
-            (404, false, true,  false),
-            (422, false, true,  false),
+            (400, false, true, false),
+            (401, false, true, false),
+            (403, false, true, false),
+            (404, false, true, false),
+            (422, false, true, false),
             (500, false, false, true),
             (502, false, false, true),
             (503, false, false, true),
         ];
         for &(status, ok, ce, se) in codes_and_expected {
-            let r = HttpResponse { status, status_text: String::new(), headers: HashMap::new(), body: String::new() };
+            let r = HttpResponse {
+                status,
+                status_text: String::new(),
+                headers: HashMap::new(),
+                body: String::new(),
+            };
             assert_eq!(r.is_success(), ok, "is_success wrong for {status}");
-            assert_eq!(r.is_client_error(), ce, "is_client_error wrong for {status}");
-            assert_eq!(r.is_server_error(), se, "is_server_error wrong for {status}");
+            assert_eq!(
+                r.is_client_error(),
+                ce,
+                "is_client_error wrong for {status}"
+            );
+            assert_eq!(
+                r.is_server_error(),
+                se,
+                "is_server_error wrong for {status}"
+            );
         }
     }
 
@@ -648,10 +708,26 @@ mod tests {
 
     #[test]
     fn test_http_error_display_all_variants() {
-        assert!(HttpError::InvalidUrl("x".to_string()).to_string().contains("Invalid URL"));
-        assert!(HttpError::InvalidHeader("y".to_string()).to_string().contains("Invalid header"));
-        assert!(HttpError::RequestFailed("z".to_string()).to_string().contains("Request failed"));
-        assert!(HttpError::ResponseParseError("w".to_string()).to_string().contains("Response parse error"));
+        assert!(
+            HttpError::InvalidUrl("x".to_string())
+                .to_string()
+                .contains("Invalid URL")
+        );
+        assert!(
+            HttpError::InvalidHeader("y".to_string())
+                .to_string()
+                .contains("Invalid header")
+        );
+        assert!(
+            HttpError::RequestFailed("z".to_string())
+                .to_string()
+                .contains("Request failed")
+        );
+        assert!(
+            HttpError::ResponseParseError("w".to_string())
+                .to_string()
+                .contains("Response parse error")
+        );
     }
 
     #[test]
@@ -694,16 +770,28 @@ mod tests {
 
     #[test]
     fn test_request_event_display_tls_events() {
-        assert_eq!(RequestEvent::TlsHandshakeStarted.to_string(), "Starting TLS handshake");
-        assert_eq!(RequestEvent::TlsHandshakeComplete.to_string(), "TLS handshake complete");
+        assert_eq!(
+            RequestEvent::TlsHandshakeStarted.to_string(),
+            "Starting TLS handshake"
+        );
+        assert_eq!(
+            RequestEvent::TlsHandshakeComplete.to_string(),
+            "TLS handshake complete"
+        );
     }
 
     #[test]
     fn test_request_event_display_sending_and_waiting() {
         assert_eq!(RequestEvent::SendingRequest.to_string(), "Sending request");
         assert_eq!(RequestEvent::RequestSent.to_string(), "Request sent");
-        assert_eq!(RequestEvent::WaitingForResponse.to_string(), "Waiting for response");
-        assert_eq!(RequestEvent::ReceivingHeaders.to_string(), "Receiving headers");
+        assert_eq!(
+            RequestEvent::WaitingForResponse.to_string(),
+            "Waiting for response"
+        );
+        assert_eq!(
+            RequestEvent::ReceivingHeaders.to_string(),
+            "Receiving headers"
+        );
     }
 
     #[test]
@@ -714,15 +802,8 @@ mod tests {
     }
 
     #[test]
-    fn test_request_event_display_receiving_body() {
-        let ev = RequestEvent::ReceivingBody(1024);
-        assert!(ev.to_string().contains("1024"));
-        assert!(ev.to_string().contains("bytes"));
-    }
-
-    #[test]
     fn test_request_event_display_completed() {
-        assert_eq!(RequestEvent::Completed.to_string(), "Request completed");
+        assert_eq!(RequestEvent::Completed(25).to_string(), "Request completed: 25 total bytes");
     }
 
     #[test]
