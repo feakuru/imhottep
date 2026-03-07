@@ -48,7 +48,10 @@ fn count_wrapped_lines(text: &str, inner_width: usize) -> u16 {
 }
 
 /// Renders a scrollable, word-wrapped `Paragraph` with an optional vertical
-/// scrollbar.  Clamps `scroll` so it never exceeds the last visible line.
+/// scrollbar.  If `auto_scroll_end` is true the scroll position is set to the
+/// last visible line (useful for live-updating windows where new data should
+/// be revealed as it arrives). Otherwise clamps `scroll` so it never exceeds
+/// the last visible line.
 fn render_scrollable_paragraph(
     frame: &mut Frame,
     text: String,
@@ -56,6 +59,7 @@ fn render_scrollable_paragraph(
     style: Style,
     area: Rect,
     scroll: &mut u16,
+    auto_scroll_end: bool,
 ) {
     let inner = block.inner(area);
     let visible_lines = inner.height;
@@ -63,7 +67,11 @@ fn render_scrollable_paragraph(
 
     let line_count = count_wrapped_lines(&text, inner_width);
     let max_scroll = line_count.saturating_sub(visible_lines);
-    *scroll = (*scroll).min(max_scroll);
+    if auto_scroll_end {
+        *scroll = max_scroll;
+    } else {
+        *scroll = (*scroll).min(max_scroll);
+    }
 
     let paragraph = Paragraph::new(text)
         .block(block)
@@ -369,6 +377,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         body_style,
         left_chunks[2],
         &mut app.body_scroll,
+        true,
     );
 
     // ── Request Events ────────────────────────────────────────────────────────
@@ -400,6 +409,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         events_style,
         right_chunks[1],
         &mut app.events_scroll,
+        true,
     );
 
     // ── Response ──────────────────────────────────────────────────────────────
@@ -559,6 +569,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             response_style,
             right_chunks[0],
             &mut app.response_scroll,
+            true,
         );
     }
 
