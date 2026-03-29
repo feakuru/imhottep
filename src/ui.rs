@@ -449,13 +449,13 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     // ── Request Events ────────────────────────────────────────────────────────
     let is_events_focused = app.focused_field == FocusableField::RequestEvents;
 
-    let events_text = if app.request_events.is_empty() {
+    let events_text = if app.current_request_events().is_empty() {
         "(no events yet)".to_string()
     } else {
-        app.request_events.join("\n")
+        app.current_request_events().join("\n")
     };
 
-    let events_style = if app.pending_response.is_some() {
+    let events_style = if app.current_request_is_pending() {
         Style::default().fg(Color::Cyan)
     } else if is_events_focused {
         Style::default().fg(Color::Gray).bg(Color::DarkGray)
@@ -485,9 +485,9 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Determine the foreground color from response state, then apply the
     // focus background once rather than repeating it in every branch.
-    let response_fg = if app.pending_response.is_some() {
+    let response_fg = if app.current_request_is_pending() {
         Some(Color::Cyan)
-    } else if let Some(Ok(ref resp)) = app.last_response {
+    } else if let Some(Ok(resp)) = app.current_last_response() {
         Some(if resp.is_success() {
             Color::Green
         } else {
@@ -501,9 +501,9 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     //   left  = "Response"
     //   center = view mode label (white when focused so it stays visible)
     //   right  = status code (only when a response is available)
-    let status_span = if app.pending_response.is_some() {
+    let status_span = if app.current_request_is_pending() {
         Span::styled("...", Style::default().fg(Color::Cyan))
-    } else if let Some(ref result) = app.last_response {
+    } else if let Some(ref result) = app.current_last_response() {
         match result {
             Ok(resp) => {
                 let color = if resp.is_success() {
@@ -545,7 +545,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         .title_top(Line::from(status_span).right_aligned())
         .border_style(focused_border_style(is_response_focused));
 
-    if is_json_mode && app.last_response.is_some() && app.pending_response.is_none() {
+    if is_json_mode && app.current_last_response().is_some() && !app.current_request_is_pending() {
         // Split the response area: body on top, filter bar at the bottom
         let response_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -632,14 +632,15 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(filter_paragraph, response_chunks[1]);
     } else {
         // Plain text mode (or pending / no response)
-        let response_text = if app.pending_response.is_some() {
+        let response_text = if app.current_request_is_pending() {
             // Render live streamed content as it arrives. If nothing yet, show a hint.
-            if app.streamed_body.is_empty() {
+            let streamed = app.current_streamed_body();
+            if streamed.is_empty() {
                 "Receiving response...".to_string()
             } else {
-                app.streamed_body.clone()
+                streamed.to_string()
             }
-        } else if let Some(ref result) = app.last_response {
+        } else if let Some(ref result) = app.current_last_response() {
             match result {
                 Ok(response) => response.body.clone(),
                 Err(err) => format!("Error: {}", err),

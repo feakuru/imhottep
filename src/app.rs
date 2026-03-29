@@ -1,6 +1,7 @@
 use crate::http_client::{HttpRequest, HttpResponse, HttpRuntime, RequestEvent};
 use crate::keymap::{KeyContext, Keymap};
 use hyper::Method;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
@@ -49,10 +50,15 @@ pub struct App {
     pub current_request_index: Option<usize>,
     pub pending_response:
         Option<oneshot::Receiver<Result<HttpResponse, crate::http_client::HttpError>>>,
+    /// The request index that is currently in-flight (set when the request is sent).
+    pub pending_request_index: Option<usize>,
     pub event_receiver: Option<mpsc::UnboundedReceiver<RequestEvent>>,
-    pub request_events: Vec<String>,
-    pub streamed_body: String,
-    pub last_response: Option<Result<HttpResponse, String>>,
+    /// Per-request event log (keyed by request index).
+    pub request_events_per: HashMap<usize, Vec<String>>,
+    /// Per-request streamed body accumulator (keyed by request index).
+    pub streamed_body_per: HashMap<usize, String>,
+    /// Per-request last response (keyed by request index).
+    pub last_response_per: HashMap<usize, Result<HttpResponse, String>>,
     pub http_runtime: HttpRuntime,
     pub editing_field: Option<EditingField>,
     pub focused_field: FocusableField,
@@ -89,9 +95,10 @@ impl App {
             requests,
             current_request_index,
             pending_response: None,
+            pending_request_index: None,
             event_receiver: None,
-            request_events: Vec::new(),
-            last_response: None,
+            request_events_per: HashMap::new(),
+            last_response_per: HashMap::new(),
             http_runtime: HttpRuntime::new().expect("Failed to create HTTP runtime"),
             editing_field: None,
             focused_field: FocusableField::Url,
@@ -109,7 +116,7 @@ impl App {
             body_scroll: 0,
             events_scroll: 0,
             response_scroll: 0,
-            streamed_body: String::new(),
+            streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
         }
@@ -135,6 +142,58 @@ impl App {
         if let Some(idx) = self.current_request_index {
             if idx < self.requests.len() {
                 self.requests.remove(idx);
+                // Clean up per-request response state for the deleted index.
+                // Indices above the deleted one shift down by one, so rebuild the maps.
+                self.last_response_per = self
+                    .last_response_per
+                    .drain()
+                    .filter_map(|(k, v)| {
+                        if k == idx {
+                            None
+                        } else if k > idx {
+                            Some((k - 1, v))
+                        } else {
+                            Some((k, v))
+                        }
+                    })
+                    .collect();
+                self.streamed_body_per = self
+                    .streamed_body_per
+                    .drain()
+                    .filter_map(|(k, v)| {
+                        if k == idx {
+                            None
+                        } else if k > idx {
+                            Some((k - 1, v))
+                        } else {
+                            Some((k, v))
+                        }
+                    })
+                    .collect();
+                self.request_events_per = self
+                    .request_events_per
+                    .drain()
+                    .filter_map(|(k, v)| {
+                        if k == idx {
+                            None
+                        } else if k > idx {
+                            Some((k - 1, v))
+                        } else {
+                            Some((k, v))
+                        }
+                    })
+                    .collect();
+                // Also shift the pending index if needed.
+                if let Some(pending) = self.pending_request_index {
+                    if pending == idx {
+                        // The in-flight request was deleted; abandon its results.
+                        self.pending_response = None;
+                        self.pending_request_index = None;
+                        self.event_receiver = None;
+                    } else if pending > idx {
+                        self.pending_request_index = Some(pending - 1);
+                    }
+                }
                 if self.requests.is_empty() {
                     self.current_request_index = None;
                 } else if idx >= self.requests.len() {
@@ -167,13 +226,16 @@ impl App {
     }
 
     pub fn send_current_request(&mut self) {
-        if let Some(request) = self.get_current_request().cloned() {
-            let (result_rx, event_rx) = self.http_runtime.execute_request(request);
-            self.pending_response = Some(result_rx);
-            self.event_receiver = Some(event_rx);
-            self.request_events.clear();
-            self.streamed_body.clear();
-            self.last_response = None;
+        if let Some(idx) = self.current_request_index {
+            if let Some(request) = self.requests.get(idx).cloned() {
+                let (result_rx, event_rx) = self.http_runtime.execute_request(request);
+                self.pending_response = Some(result_rx);
+                self.pending_request_index = Some(idx);
+                self.event_receiver = Some(event_rx);
+                self.request_events_per.insert(idx, Vec::new());
+                self.streamed_body_per.insert(idx, String::new());
+                self.last_response_per.remove(&idx);
+            }
         }
     }
 
@@ -181,24 +243,30 @@ impl App {
         if let Some(receiver) = &mut self.pending_response {
             match receiver.try_recv() {
                 Ok(result) => {
-                    // Move the result into last_response and also populate streamed_body
-                    match result {
-                        Ok(resp) => {
-                            self.streamed_body = resp.body.clone();
-                            self.last_response = Some(Ok(resp));
-                        }
-                        Err(e) => {
-                            self.last_response = Some(Err(e.to_string()));
+                    if let Some(idx) = self.pending_request_index {
+                        match result {
+                            Ok(resp) => {
+                                self.streamed_body_per.insert(idx, resp.body.clone());
+                                self.last_response_per.insert(idx, Ok(resp));
+                            }
+                            Err(e) => {
+                                self.last_response_per.insert(idx, Err(e.to_string()));
+                            }
                         }
                     }
                     self.pending_response = None;
+                    self.pending_request_index = None;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still waiting
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    self.last_response = Some(Err("Request channel closed".to_string()));
+                    if let Some(idx) = self.pending_request_index {
+                        self.last_response_per
+                            .insert(idx, Err("Request channel closed".to_string()));
+                    }
                     self.pending_response = None;
+                    self.pending_request_index = None;
                 }
             }
         }
@@ -209,15 +277,21 @@ impl App {
         if let Some(receiver) = &mut self.event_receiver {
             // Drain all available events
             while let Ok(event) = receiver.try_recv() {
-                match event {
-                    crate::http_client::RequestEvent::BodyChunk(s) => {
-                        // Append chunk to streamed buffer (lossy UTF-8 already on sender)
-                        self.streamed_body.push_str(&s);
-                        self.request_events
-                            .push(format!("Response chunk received: {} bytes", s.len()));
-                    }
-                    other => {
-                        self.request_events.push(other.to_string());
+                if let Some(idx) = self.pending_request_index {
+                    match event {
+                        crate::http_client::RequestEvent::BodyChunk(s) => {
+                            self.streamed_body_per.entry(idx).or_default().push_str(&s);
+                            self.request_events_per
+                                .entry(idx)
+                                .or_default()
+                                .push(format!("Response chunk received: {} bytes", s.len()));
+                        }
+                        other => {
+                            self.request_events_per
+                                .entry(idx)
+                                .or_default()
+                                .push(other.to_string());
+                        }
                     }
                 }
                 received_any = true;
@@ -243,9 +317,36 @@ impl App {
         }
     }
 
+    /// Returns whether a request is currently in-flight for the *current* request.
+    pub fn current_request_is_pending(&self) -> bool {
+        self.pending_request_index == self.current_request_index && self.pending_response.is_some()
+    }
+
+    /// Returns the last response for the currently selected request, if any.
+    pub fn current_last_response(&self) -> Option<&Result<HttpResponse, String>> {
+        self.current_request_index
+            .and_then(|idx| self.last_response_per.get(&idx))
+    }
+
+    /// Returns the streamed body accumulator for the currently selected request.
+    pub fn current_streamed_body(&self) -> &str {
+        self.current_request_index
+            .and_then(|idx| self.streamed_body_per.get(&idx))
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Returns the request events log for the currently selected request.
+    pub fn current_request_events(&self) -> &[String] {
+        self.current_request_index
+            .and_then(|idx| self.request_events_per.get(&idx))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Returns true when the last response body is valid JSON (parsed by serde_json).
     pub fn is_response_json(&self) -> bool {
-        if let Some(Ok(ref resp)) = self.last_response {
+        if let Some(Ok(resp)) = self.current_last_response() {
             serde_json::from_str::<serde_json::Value>(&resp.body).is_ok()
         } else {
             false
@@ -270,7 +371,7 @@ impl App {
     /// Runs the current `jq_filter` against the last response body via the
     /// `jq` binary and returns the colourised output, or an error string.
     pub fn run_jq(&self) -> String {
-        let body = match &self.last_response {
+        let body = match self.current_last_response() {
             Some(Ok(resp)) => &resp.body,
             _ => return String::new(),
         };
@@ -696,9 +797,10 @@ mod tests {
             requests,
             current_request_index,
             pending_response: None,
+            pending_request_index: None,
             event_receiver: None,
-            request_events: Vec::new(),
-            last_response: None,
+            request_events_per: HashMap::new(),
+            last_response_per: HashMap::new(),
             http_runtime: HttpRuntime::new().expect("runtime"),
             editing_field: None,
             focused_field: FocusableField::Url,
@@ -716,7 +818,7 @@ mod tests {
             body_scroll: 0,
             events_scroll: 0,
             response_scroll: 0,
-            streamed_body: String::new(),
+            streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
         }
@@ -1252,14 +1354,16 @@ mod tests {
     #[test]
     fn test_is_response_json_true_for_json_body() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response = Some(Ok(make_response(200, r#"{"key":"value"}"#)));
+        app.last_response_per
+            .insert(0, Ok(make_response(200, r#"{"key":"value"}"#)));
         assert!(app.is_response_json());
     }
 
     #[test]
     fn test_is_response_json_false_for_plain_text() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response = Some(Ok(make_response(200, "plain text response")));
+        app.last_response_per
+            .insert(0, Ok(make_response(200, "plain text response")));
         assert!(!app.is_response_json());
     }
 
@@ -1272,14 +1376,16 @@ mod tests {
     #[test]
     fn test_is_response_json_false_on_error_response() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response = Some(Err("request failed".to_string()));
+        app.last_response_per
+            .insert(0, Err("request failed".to_string()));
         assert!(!app.is_response_json());
     }
 
     #[test]
     fn test_cycle_response_view_mode_text_to_json_when_json_available() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
+        app.last_response_per
+            .insert(0, Ok(make_response(200, r#"{"ok":true}"#)));
         app.response_view_mode = ResponseViewMode::Text;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Json);
@@ -1288,7 +1394,8 @@ mod tests {
     #[test]
     fn test_cycle_response_view_mode_stays_text_when_not_json() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response = Some(Ok(make_response(200, "not json")));
+        app.last_response_per
+            .insert(0, Ok(make_response(200, "not json")));
         app.response_view_mode = ResponseViewMode::Text;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Text);
@@ -1297,7 +1404,8 @@ mod tests {
     #[test]
     fn test_cycle_response_view_mode_json_to_text() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
+        app.last_response_per
+            .insert(0, Ok(make_response(200, r#"{"ok":true}"#)));
         app.response_view_mode = ResponseViewMode::Json;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Text);
@@ -1311,6 +1419,7 @@ mod tests {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         let (tx, rx) = mpsc::unbounded_channel();
         app.event_receiver = Some(rx);
+        app.pending_request_index = Some(0);
 
         tx.send(crate::http_client::RequestEvent::Started).unwrap();
         tx.send(crate::http_client::RequestEvent::Completed(20))
@@ -1318,10 +1427,9 @@ mod tests {
 
         let received = app.check_for_events();
         assert!(received);
-        assert_eq!(app.request_events.len(), 2);
-        assert!(
-            app.request_events[0].contains("started") || app.request_events[0].contains("Request")
-        );
+        let events = app.current_request_events();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("started") || events[0].contains("Request"));
     }
 
     #[test]
@@ -1333,7 +1441,7 @@ mod tests {
 
         let received = app.check_for_events();
         assert!(!received);
-        assert!(app.request_events.is_empty());
+        assert!(app.current_request_events().is_empty());
     }
 
     #[test]
@@ -1352,14 +1460,15 @@ mod tests {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         let (tx, rx) = oneshot::channel::<Result<HttpResponse, crate::http_client::HttpError>>();
         app.pending_response = Some(rx);
+        app.pending_request_index = Some(0);
 
         // Send the response before polling
         tx.send(Ok(make_response(200, "hello"))).unwrap();
         app.check_pending_response();
 
-        assert!(app.last_response.is_some());
+        assert!(app.current_last_response().is_some());
         assert!(app.pending_response.is_none());
-        if let Some(Ok(resp)) = &app.last_response {
+        if let Some(Ok(resp)) = app.current_last_response() {
             assert_eq!(resp.status, 200);
             assert_eq!(resp.body, "hello");
         } else {
@@ -1373,12 +1482,13 @@ mod tests {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         let (tx, rx) = oneshot::channel::<Result<HttpResponse, crate::http_client::HttpError>>();
         app.pending_response = Some(rx);
+        app.pending_request_index = Some(0);
 
         drop(tx); // close without sending
         app.check_pending_response();
 
         assert!(app.pending_response.is_none());
-        assert!(matches!(&app.last_response, Some(Err(_))));
+        assert!(matches!(app.current_last_response(), Some(Err(_))));
     }
 
     #[test]
@@ -1387,12 +1497,13 @@ mod tests {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
         let (_tx, rx) = oneshot::channel::<Result<HttpResponse, crate::http_client::HttpError>>();
         app.pending_response = Some(rx);
+        app.pending_request_index = Some(0);
 
         app.check_pending_response();
 
         // Still pending, nothing received yet
         assert!(app.pending_response.is_some());
-        assert!(app.last_response.is_none());
+        assert!(app.current_last_response().is_none());
     }
 
     // ── Persistence helpers ───────────────────────────────────────────────────
