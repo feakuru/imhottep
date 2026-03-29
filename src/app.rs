@@ -1,9 +1,18 @@
 use crate::http_client::{HttpRequest, HttpResponse, HttpRuntime, RequestEvent};
 use crate::keymap::{KeyContext, Keymap};
 use hyper::Method;
+use regex::Regex;
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
+
+/// Events produced by the jq reader threads (stdout → Output, stderr → Error).
+#[derive(Debug)]
+pub(crate) enum JqEvent {
+    Output(String),
+    Error(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentScreen {
@@ -18,12 +27,15 @@ pub enum EditingField {
     Headers,
     Body,
     JsonFilter,
+    StreamPrefixRegex,
+    StreamSuffixRegex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseViewMode {
     Text,
     Json,
+    StreamedJson,
 }
 
 impl ResponseViewMode {
@@ -31,6 +43,7 @@ impl ResponseViewMode {
         match self {
             ResponseViewMode::Text => "text",
             ResponseViewMode::Json => "json",
+            ResponseViewMode::StreamedJson => "streamed json",
         }
     }
 }
@@ -73,8 +86,6 @@ pub struct App {
     pub header_autocomplete_selected: usize,
     // Response view mode
     pub response_view_mode: ResponseViewMode,
-    // jq filter expression for JSON view mode
-    pub jq_filter: String,
     // Scroll positions for each field
     pub headers_scroll: u16,
     pub body_scroll: u16,
@@ -84,6 +95,29 @@ pub struct App {
     pub last_save_status: Option<String>,
     // Keybinding map (single source of truth for dispatch + hints)
     pub keymap: Keymap,
+
+    // ── Streamed-jq mode ──────────────────────────────────────────────────────
+    /// Whether at least one stripped line successfully parsed as JSON —
+    /// gates availability of StreamedJson mode in the view-mode cycle.
+    pub streamed_jq_available: bool,
+    /// Per-request accumulator of jq-filtered lines (as raw ANSI strings).
+    pub streamed_jq_output_per: HashMap<usize, Vec<String>>,
+    /// Per-request line reassembly buffer (holds incomplete last line of a chunk).
+    pub streamed_line_buffer_per: HashMap<usize, String>,
+    /// Per-request accumulator of stripped (prefix/suffix removed) lines,
+    /// used to re-feed jq when the filter or regexes change.
+    pub streamed_stripped_lines_per: HashMap<usize, Vec<String>>,
+    /// Sender for jq events coming from the reader threads.
+    pub streamed_jq_output_tx: Option<mpsc::UnboundedSender<JqEvent>>,
+    /// Receiver for jq events from the reader threads.
+    pub streamed_jq_output_rx: Option<mpsc::UnboundedReceiver<JqEvent>>,
+    /// Per-request: the last stripped line fed to jq, used to prepend the
+    /// original value when jq reports a parse error for it.
+    pub streamed_jq_last_fed_per: HashMap<usize, String>,
+    /// Handle for the jq subprocess stdin (kept alive so the process stays running).
+    pub streamed_jq_stdin: Option<std::process::ChildStdin>,
+    /// Handle to the jq child process (for killing/waiting on cleanup).
+    pub streamed_jq_child: Option<std::process::Child>,
 }
 
 impl App {
@@ -111,7 +145,6 @@ impl App {
             header_autocomplete_visible: false,
             header_autocomplete_selected: 0,
             response_view_mode: ResponseViewMode::Text,
-            jq_filter: ".".to_string(),
             headers_scroll: 0,
             body_scroll: 0,
             events_scroll: 0,
@@ -119,6 +152,15 @@ impl App {
             streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
+            streamed_jq_available: false,
+            streamed_jq_output_per: HashMap::new(),
+            streamed_line_buffer_per: HashMap::new(),
+            streamed_stripped_lines_per: HashMap::new(),
+            streamed_jq_output_tx: None,
+            streamed_jq_output_rx: None,
+            streamed_jq_last_fed_per: HashMap::new(),
+            streamed_jq_stdin: None,
+            streamed_jq_child: None,
         }
     }
 
@@ -130,6 +172,26 @@ impl App {
     pub fn get_current_request_mut(&mut self) -> Option<&mut HttpRequest> {
         self.current_request_index
             .and_then(|idx| self.requests.get_mut(idx))
+    }
+
+    // ── Per-request filter/regex accessors ───────────────────────────────────
+
+    pub fn current_jq_filter(&self) -> &str {
+        self.get_current_request()
+            .map(|r| r.jq_filter.as_str())
+            .unwrap_or(".")
+    }
+
+    pub fn current_stream_prefix_regex(&self) -> &str {
+        self.get_current_request()
+            .map(|r| r.stream_prefix_regex.as_str())
+            .unwrap_or(r"^\w+:\s*")
+    }
+
+    pub fn current_stream_suffix_regex(&self) -> &str {
+        self.get_current_request()
+            .map(|r| r.stream_suffix_regex.as_str())
+            .unwrap_or(r"\s*$")
     }
 
     pub fn create_new_request(&mut self) {
@@ -228,6 +290,9 @@ impl App {
     pub fn send_current_request(&mut self) {
         if let Some(idx) = self.current_request_index {
             if let Some(request) = self.requests.get(idx).cloned() {
+                // Kill any existing streamed-jq process
+                self.kill_streamed_jq();
+
                 let (result_rx, event_rx) = self.http_runtime.execute_request(request);
                 self.pending_response = Some(result_rx);
                 self.pending_request_index = Some(idx);
@@ -235,6 +300,12 @@ impl App {
                 self.request_events_per.insert(idx, Vec::new());
                 self.streamed_body_per.insert(idx, String::new());
                 self.last_response_per.remove(&idx);
+                // Reset per-request streamed-jq accumulators
+                self.streamed_jq_output_per.insert(idx, Vec::new());
+                self.streamed_line_buffer_per.insert(idx, String::new());
+                self.streamed_stripped_lines_per.insert(idx, Vec::new());
+                self.streamed_jq_last_fed_per.remove(&idx);
+                self.streamed_jq_available = false;
             }
         }
     }
@@ -255,7 +326,12 @@ impl App {
                         }
                     }
                     self.pending_response = None;
-                    self.pending_request_index = None;
+                    // NOTE: We intentionally do NOT clear pending_request_index,
+                    // flush the line buffer, or close jq stdin here.  Body-chunk
+                    // events may still be buffered in event_receiver — they are
+                    // processed in check_for_events using pending_request_index.
+                    // Cleanup happens in check_for_events once the event channel
+                    // is fully drained (sender dropped / disconnected).
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still waiting
@@ -267,6 +343,7 @@ impl App {
                     }
                     self.pending_response = None;
                     self.pending_request_index = None;
+                    self.streamed_jq_stdin = None;
                 }
             }
         }
@@ -274,29 +351,106 @@ impl App {
 
     pub fn check_for_events(&mut self) -> bool {
         let mut received_any = false;
-        if let Some(receiver) = &mut self.event_receiver {
-            // Drain all available events
-            while let Ok(event) = receiver.try_recv() {
-                if let Some(idx) = self.pending_request_index {
-                    match event {
-                        crate::http_client::RequestEvent::BodyChunk(s) => {
-                            self.streamed_body_per.entry(idx).or_default().push_str(&s);
-                            self.request_events_per
-                                .entry(idx)
-                                .or_default()
-                                .push(format!("Response chunk received: {} bytes", s.len()));
+
+        // Drain jq output events from the reader threads.
+        // Also detect if the jq channel is disconnected (jq exited,
+        // all reader threads dropped their tx clones).
+        let mut jq_channel_closed = false;
+        if let Some(rx) = &mut self.streamed_jq_output_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => {
+                        if let Some(idx) = self.current_request_index {
+                            let output_lines = self.streamed_jq_output_per.entry(idx).or_default();
+                            match event {
+                                JqEvent::Output(line) => {
+                                    output_lines.push(line);
+                                }
+                                JqEvent::Error(err) => {
+                                    let original = self
+                                        .streamed_jq_last_fed_per
+                                        .get(&idx)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    output_lines
+                                        .push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
+                                }
+                            }
                         }
-                        other => {
-                            self.request_events_per
-                                .entry(idx)
-                                .or_default()
-                                .push(other.to_string());
-                        }
+                        received_any = true;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        jq_channel_closed = true;
+                        break;
                     }
                 }
-                received_any = true;
             }
         }
+        if jq_channel_closed {
+            // jq has exited and all output has been consumed; clean up.
+            self.streamed_jq_output_rx = None;
+            self.streamed_jq_output_tx = None;
+            if let Some(mut child) = self.streamed_jq_child.take() {
+                let _ = child.wait();
+            }
+        }
+
+        // Collect all events first (releases the borrow on event_receiver), then process.
+        // Also detect whether the event channel is disconnected (sender dropped,
+        // all messages already received) — this means no more body chunks will arrive.
+        let mut collected_events: Vec<RequestEvent> = Vec::new();
+        let mut event_channel_closed = false;
+        if let Some(receiver) = &mut self.event_receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => {
+                        collected_events.push(event);
+                        received_any = true;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        event_channel_closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let idx_opt = self.pending_request_index;
+        for event in collected_events {
+            if let Some(idx) = idx_opt {
+                match event {
+                    crate::http_client::RequestEvent::BodyChunk(s) => {
+                        self.streamed_body_per.entry(idx).or_default().push_str(&s);
+                        self.request_events_per
+                            .entry(idx)
+                            .or_default()
+                            .push(format!("Response chunk received: {} bytes", s.len()));
+                        // Feed the chunk into the line reassembly buffer
+                        self.process_chunk(idx, s);
+                    }
+                    other => {
+                        self.request_events_per
+                            .entry(idx)
+                            .or_default()
+                            .push(other.to_string());
+                    }
+                }
+            }
+        }
+
+        // Once the HTTP response oneshot has resolved (pending_response is None)
+        // AND the event channel is fully drained+closed, perform final cleanup:
+        // flush the line buffer and close jq stdin so it can process the last input.
+        if event_channel_closed && self.pending_response.is_none() {
+            if let Some(idx) = self.pending_request_index.take() {
+                self.flush_line_buffer(idx);
+            }
+            self.streamed_jq_stdin = None;
+            self.event_receiver = None;
+        }
+
         received_any
     }
 
@@ -353,18 +507,380 @@ impl App {
         }
     }
 
+    // ── Streamed-jq helpers ───────────────────────────────────────────────────
+
+    /// Strip prefix and suffix regex from a raw line.  Returns the stripped
+    /// string, or an error message if a regex fails to compile.
+    fn strip_line(&self, raw: &str) -> Result<String, String> {
+        let stripped = if let Ok(re) = Regex::new(self.current_stream_prefix_regex()) {
+            re.replace(raw, "").into_owned()
+        } else {
+            return Err(format!(
+                "Invalid prefix regex: {}",
+                self.current_stream_prefix_regex()
+            ));
+        };
+        let stripped = if let Ok(re) = Regex::new(self.current_stream_suffix_regex()) {
+            re.replace(&stripped, "").into_owned()
+        } else {
+            return Err(format!(
+                "Invalid suffix regex: {}",
+                self.current_stream_suffix_regex()
+            ));
+        };
+        Ok(stripped)
+    }
+
+    /// Ensure the persistent jq subprocess is running (starting it if needed).
+    /// Returns `true` if jq is ready to receive input.
+    fn ensure_jq_running(&mut self) -> bool {
+        if self.streamed_jq_stdin.is_some() {
+            return true;
+        }
+        let filter = {
+            let f = self.current_jq_filter();
+            if f.trim().is_empty() {
+                ".".to_string()
+            } else {
+                f.to_string()
+            }
+        };
+        match std::process::Command::new("jq")
+            .args(["--color-output", "--unbuffered", &filter])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let stdout = child.stdout.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
+                let stdin = child.stdin.take().unwrap();
+
+                // Spawn a reader thread that collects stdout + stderr and sends
+                // them through an mpsc channel.
+                let (tx, rx) = mpsc::unbounded_channel::<JqEvent>();
+                let tx_stdout = tx.clone();
+                let tx_err = tx.clone();
+                let stdout_reader = BufReader::new(stdout);
+                std::thread::spawn(move || {
+                    for line in stdout_reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                if tx_stdout.send(JqEvent::Output(l)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                let stderr_reader = BufReader::new(stderr);
+                std::thread::spawn(move || {
+                    for line in stderr_reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                if tx_err.send(JqEvent::Error(l.trim().to_string())).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                self.streamed_jq_output_tx = Some(tx);
+                self.streamed_jq_output_rx = Some(rx);
+                self.streamed_jq_stdin = Some(stdin);
+                self.streamed_jq_child = Some(child);
+                true
+            }
+            Err(e) => {
+                // Record the error as a fake output line
+                let msg = format!("\x1b[31m// Failed to start jq: {e}\x1b[0m");
+                if let Some(idx) = self.current_request_index {
+                    self.streamed_jq_output_per
+                        .entry(idx)
+                        .or_default()
+                        .push(msg);
+                }
+                false
+            }
+        }
+    }
+
+    /// Kill and clean up the jq subprocess if running.
+    pub fn kill_streamed_jq(&mut self) {
+        self.streamed_jq_stdin = None; // drops stdin → jq gets EOF
+        self.streamed_jq_output_tx = None;
+        self.streamed_jq_output_rx = None;
+        if let Some(mut child) = self.streamed_jq_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Send a single stripped line to the jq subprocess stdin.
+    /// If the write fails (jq died after a parse error), we drain any remaining
+    /// output from the old process, kill it, spawn a fresh one, and retry.
+    fn feed_line_to_jq(&mut self, idx: usize, stripped: &str) {
+        if !self.ensure_jq_running() {
+            return;
+        }
+        let write_ok = if let Some(stdin) = &mut self.streamed_jq_stdin {
+            writeln!(stdin, "{stripped}").is_ok()
+        } else {
+            false
+        };
+        if !write_ok {
+            // jq died (parse error on previous line). Drain any output that
+            // already arrived in the channel before dropping it, then restart.
+            if let Some(rx) = &mut self.streamed_jq_output_rx {
+                while let Ok(event) = rx.try_recv() {
+                    let out = self.streamed_jq_output_per.entry(idx).or_default();
+                    match event {
+                        JqEvent::Output(line) => out.push(line),
+                        JqEvent::Error(err) => {
+                            let original = self
+                                .streamed_jq_last_fed_per
+                                .get(&idx)
+                                .cloned()
+                                .unwrap_or_default();
+                            out.push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
+                        }
+                    }
+                }
+            }
+            self.kill_streamed_jq();
+            if self.ensure_jq_running() {
+                if let Some(stdin) = &mut self.streamed_jq_stdin {
+                    let _ = writeln!(stdin, "{stripped}");
+                }
+            }
+        }
+        // Remember this as the last fed line so we can show it alongside
+        // any jq parse error that arrives for it.
+        self.streamed_jq_last_fed_per
+            .insert(idx, stripped.to_string());
+    }
+
+    /// Run `jq` synchronously on a batch of pre-stripped JSON lines, returning
+    /// display lines (colourised output or inline error annotations).
+    ///
+    /// Because jq exits with code 5 on the first parse error we restart it for
+    /// each offending line and continue, so every line gets processed.
+    fn run_jq_batch_sync(filter: &str, stripped_lines: &[String]) -> Vec<String> {
+        let mut output: Vec<String> = Vec::new();
+        let effective_filter = if filter.trim().is_empty() {
+            "."
+        } else {
+            filter
+        };
+
+        // Spawn a fresh jq per line and wait for it to finish.  This is
+        // slightly slower than keeping a persistent process, but it is
+        // trivially correct: no output can be lost to timing races, and
+        // a parse error on one line never affects subsequent lines.
+        for line in stripped_lines {
+            match std::process::Command::new("jq")
+                .args(["--color-output", effective_filter])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Err(e) => {
+                    output.push(format!("\x1b[31m// Failed to start jq: {e}\x1b[0m"));
+                    break; // jq not available — no point continuing
+                }
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = writeln!(stdin, "{line}");
+                        // stdin drops here → EOF → jq processes and exits
+                    }
+                    match child.wait_with_output() {
+                        Err(e) => {
+                            output.push(format!("\x1b[31m// jq wait error: {e}\x1b[0m"));
+                        }
+                        Ok(result) => {
+                            if result.status.success() {
+                                let s = String::from_utf8_lossy(&result.stdout);
+                                for out_line in s.lines() {
+                                    output.push(out_line.to_string());
+                                }
+                            } else {
+                                // Parse/filter error — show original line + error message.
+                                let err = String::from_utf8_lossy(&result.stderr);
+                                let err_trimmed = err.trim();
+                                output.push(format!("{line} \x1b[31m// jq: {err_trimmed}\x1b[0m"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Process a raw chunk: append to line buffer, extract complete lines,
+    /// apply prefix/suffix stripping, update availability flag, and feed jq.
+    fn process_chunk(&mut self, idx: usize, chunk: String) {
+        let buf = self.streamed_line_buffer_per.entry(idx).or_default();
+        buf.push_str(&chunk);
+
+        // Split on newlines; the last element (possibly empty) is the
+        // incomplete tail that stays in the buffer.
+        let combined = std::mem::take(buf);
+        let mut parts: Vec<&str> = combined.split('\n').collect();
+        let tail = parts.pop().unwrap_or("").to_string();
+        *self.streamed_line_buffer_per.entry(idx).or_default() = tail;
+
+        for raw_line in parts {
+            self.handle_complete_line(idx, raw_line);
+        }
+    }
+
+    /// Process one complete (newline-terminated) raw line.
+    fn handle_complete_line(&mut self, idx: usize, raw: &str) {
+        let trimmed = raw.trim_end_matches('\r'); // handle CRLF
+        match self.strip_line(trimmed) {
+            Err(e) => {
+                let msg = format!("\x1b[31m// {e}\x1b[0m");
+                self.streamed_jq_output_per
+                    .entry(idx)
+                    .or_default()
+                    .push(msg);
+            }
+            Ok(stripped) => {
+                if stripped.is_empty() {
+                    return;
+                }
+                // Check if this line is valid JSON → unlock streamed-jq mode
+                if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
+                    self.streamed_jq_available = true;
+                }
+                // Save stripped line for re-processing on filter change
+                self.streamed_stripped_lines_per
+                    .entry(idx)
+                    .or_default()
+                    .push(stripped.clone());
+                // Feed to jq
+                self.feed_line_to_jq(idx, &stripped);
+            }
+        }
+    }
+
+    /// Flush any remaining bytes in the line buffer as a final (incomplete) line.
+    fn flush_line_buffer(&mut self, idx: usize) {
+        let tail = self
+            .streamed_line_buffer_per
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        if !tail.is_empty() {
+            self.handle_complete_line(idx, &tail);
+            self.streamed_line_buffer_per.insert(idx, String::new());
+        }
+    }
+
+    /// Re-process all accumulated stripped lines through a fresh jq subprocess
+    /// (called after the user changes the jq filter or prefix/suffix regexes).
+    ///
+    /// Unlike the live-streaming path this runs jq **synchronously** — one
+    /// jq invocation per stripped line, waiting for each to finish before
+    /// moving on.  This guarantees that no output is lost to timing races
+    /// (jq exiting before we drain its channel, etc.).
+    pub fn reprocess_streamed_jq(&mut self) {
+        let Some(idx) = self.current_request_index else {
+            return;
+        };
+        // Kill any running live-streaming jq process.
+        self.kill_streamed_jq();
+
+        // Clear old output and last-fed tracker.
+        self.streamed_jq_output_per.insert(idx, Vec::new());
+        self.streamed_jq_last_fed_per.remove(&idx);
+
+        // Re-strip all raw lines from the complete body, rebuilding the
+        // stripped-lines accumulator and the availability flag.
+        let body = self
+            .streamed_body_per
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        self.streamed_stripped_lines_per.insert(idx, Vec::new());
+        self.streamed_jq_available = false;
+
+        // Collect stripped lines without calling handle_complete_line
+        // (which would try to feed the async jq that we just killed).
+        let raw_lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+        let mut stripped_lines: Vec<String> = Vec::new();
+        for raw in &raw_lines {
+            let trimmed = raw.trim_end_matches('\r');
+            match self.strip_line(trimmed) {
+                Err(e) => {
+                    // Invalid regex — record error and continue.
+                    self.streamed_jq_output_per
+                        .entry(idx)
+                        .or_default()
+                        .push(format!("\x1b[31m// {e}\x1b[0m"));
+                }
+                Ok(stripped) => {
+                    if stripped.is_empty() {
+                        continue;
+                    }
+                    if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
+                        self.streamed_jq_available = true;
+                    }
+                    self.streamed_stripped_lines_per
+                        .entry(idx)
+                        .or_default()
+                        .push(stripped.clone());
+                    stripped_lines.push(stripped);
+                }
+            }
+        }
+
+        // Run jq synchronously on the collected stripped lines.
+        let filter = self.current_jq_filter().to_string();
+        let batch_output = Self::run_jq_batch_sync(&filter, &stripped_lines);
+        self.streamed_jq_output_per
+            .entry(idx)
+            .or_default()
+            .extend(batch_output);
+    }
+
+    /// Returns the joined streamed-jq output for the currently selected request.
+    pub fn current_streamed_jq_output(&self) -> String {
+        self.current_request_index
+            .and_then(|idx| self.streamed_jq_output_per.get(&idx))
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_default()
+    }
+
     /// Cycles to the next available view mode.  Json mode is only entered when
-    /// the response body is valid JSON; otherwise it is skipped.
+    /// the response body is valid JSON; StreamedJson mode only when at least one
+    /// stripped streamed line was valid JSON.
     pub fn cycle_response_view_mode(&mut self) {
         self.response_view_mode = match self.response_view_mode {
             ResponseViewMode::Text => {
                 if self.is_response_json() {
                     ResponseViewMode::Json
+                } else if self.streamed_jq_available {
+                    ResponseViewMode::StreamedJson
                 } else {
                     ResponseViewMode::Text
                 }
             }
-            ResponseViewMode::Json => ResponseViewMode::Text,
+            ResponseViewMode::Json => {
+                if self.streamed_jq_available {
+                    ResponseViewMode::StreamedJson
+                } else {
+                    ResponseViewMode::Text
+                }
+            }
+            ResponseViewMode::StreamedJson => ResponseViewMode::Text,
         };
     }
 
@@ -375,10 +891,10 @@ impl App {
             Some(Ok(resp)) => &resp.body,
             _ => return String::new(),
         };
-        let filter = if self.jq_filter.trim().is_empty() {
+        let filter = if self.current_jq_filter().trim().is_empty() {
             "."
         } else {
-            self.jq_filter.as_str()
+            self.current_jq_filter()
         };
         match std::process::Command::new("jq")
             .args(["--color-output", filter])
@@ -813,7 +1329,6 @@ mod tests {
             header_autocomplete_visible: false,
             header_autocomplete_selected: 0,
             response_view_mode: ResponseViewMode::Text,
-            jq_filter: ".".to_string(),
             headers_scroll: 0,
             body_scroll: 0,
             events_scroll: 0,
@@ -821,6 +1336,15 @@ mod tests {
             streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
+            streamed_jq_available: false,
+            streamed_jq_output_per: HashMap::new(),
+            streamed_line_buffer_per: HashMap::new(),
+            streamed_stripped_lines_per: HashMap::new(),
+            streamed_jq_output_tx: None,
+            streamed_jq_output_rx: None,
+            streamed_jq_last_fed_per: HashMap::new(),
+            streamed_jq_stdin: None,
+            streamed_jq_child: None,
         }
     }
 

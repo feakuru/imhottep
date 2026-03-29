@@ -58,6 +58,8 @@ pub enum Action {
     SendRequest,
     CycleViewMode,
     EditJqFilter,
+    EditStreamPrefixRegex,
+    EditStreamSuffixRegex,
 
     // ── Editing mode ──────────────────────────────────────────────────────────
     CancelEdit,
@@ -600,19 +602,32 @@ impl Keymap {
         });
 
         // ── Request — navigation, Response focused ────────────────────────────
-        // f for jq filter; only active when response is focused (shown only in
-        // that context, but we always register it — the execute_action handler
-        // guards on json mode).
+        // f for jq filter; p for prefix regex; s_r for suffix regex — only
+        // active when response is focused (handler guards on view mode).
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
             editing: None,
             focus: Some(FocusableField::Response),
-            bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Char('f')],
-                action: Action::EditJqFilter,
-                hint: "f",
-                description: "jq filter",
-            }],
+            bindings: vec![
+                Binding {
+                    triggers: vec![KeyTrigger::Char('f')],
+                    action: Action::EditJqFilter,
+                    hint: "f",
+                    description: "jq filter",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Char('p')],
+                    action: Action::EditStreamPrefixRegex,
+                    hint: "p",
+                    description: "prefix regex",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Char('x')],
+                    action: Action::EditStreamSuffixRegex,
+                    hint: "x",
+                    description: "suffix regex",
+                },
+            ],
         });
 
         // ── Editing mode — any field ──────────────────────────────────────────
@@ -682,6 +697,32 @@ impl Keymap {
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
             editing: Some(Some(EditingField::JsonFilter)),
+            focus: None,
+            bindings: vec![Binding {
+                triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                action: Action::ConfirmEdit,
+                hint: "enter",
+                description: "apply",
+            }],
+        });
+
+        // StreamPrefixRegex editing
+        rules.push(ContextRule {
+            screen: CurrentScreen::Request,
+            editing: Some(Some(EditingField::StreamPrefixRegex)),
+            focus: None,
+            bindings: vec![Binding {
+                triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                action: Action::ConfirmEdit,
+                hint: "enter",
+                description: "apply",
+            }],
+        });
+
+        // StreamSuffixRegex editing
+        rules.push(ContextRule {
+            screen: CurrentScreen::Request,
+            editing: Some(Some(EditingField::StreamSuffixRegex)),
             focus: None,
             bindings: vec![Binding {
                 triggers: vec![KeyTrigger::Code(KeyCode::Enter)],

@@ -16,7 +16,7 @@ pub mod http_client;
 mod ui;
 use crate::{
     app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode},
-    keymap::Action,
+    keymap::{Action, Action::EditStreamPrefixRegex, Action::EditStreamSuffixRegex},
     ui::ui,
 };
 
@@ -63,7 +63,10 @@ where
 
         // If we have a pending response, use non-blocking event read
         // so we can check for new events frequently
-        let key_event = if app.pending_response.is_some() || app.event_receiver.is_some() {
+        let has_async_work = app.pending_response.is_some()
+            || app.event_receiver.is_some()
+            || app.streamed_jq_output_rx.is_some();
+        let key_event = if has_async_work {
             if event::poll(std::time::Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     Some(key)
@@ -116,6 +119,7 @@ where
                                     }
                                 }
                                 _ => {
+                                    // JsonFilter, StreamPrefixRegex, StreamSuffixRegex, Url, Body
                                     app.input_buffer.push(c);
                                 }
                             }
@@ -242,10 +246,27 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
         }
         Action::EditJqFilter => {
             if app.focused_field == FocusableField::Response
-                && app.response_view_mode == ResponseViewMode::Json
+                && (app.response_view_mode == ResponseViewMode::Json
+                    || app.response_view_mode == ResponseViewMode::StreamedJson)
             {
-                app.input_buffer = app.jq_filter.clone();
+                app.input_buffer = app.current_jq_filter().to_string();
                 app.editing_field = Some(EditingField::JsonFilter);
+            }
+        }
+        EditStreamPrefixRegex => {
+            if app.focused_field == FocusableField::Response
+                && app.response_view_mode == ResponseViewMode::StreamedJson
+            {
+                app.input_buffer = app.current_stream_prefix_regex().to_string();
+                app.editing_field = Some(EditingField::StreamPrefixRegex);
+            }
+        }
+        EditStreamSuffixRegex => {
+            if app.focused_field == FocusableField::Response
+                && app.response_view_mode == ResponseViewMode::StreamedJson
+            {
+                app.input_buffer = app.current_stream_suffix_regex().to_string();
+                app.editing_field = Some(EditingField::StreamSuffixRegex);
             }
         }
 
@@ -271,10 +292,37 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                     app.input_buffer.clear();
                 }
                 Some(EditingField::JsonFilter) => {
-                    app.jq_filter = app.input_buffer.clone();
+                    let val = app.input_buffer.clone();
+                    if let Some(request) = app.get_current_request_mut() {
+                        request.jq_filter = val;
+                    }
                     app.editing_field = None;
                     app.input_buffer.clear();
                     app.response_scroll = 0;
+                    // Re-process streamed lines if in StreamedJson mode
+                    if app.response_view_mode == ResponseViewMode::StreamedJson {
+                        app.reprocess_streamed_jq();
+                    }
+                }
+                Some(EditingField::StreamPrefixRegex) => {
+                    let val = app.input_buffer.clone();
+                    if let Some(request) = app.get_current_request_mut() {
+                        request.stream_prefix_regex = val;
+                    }
+                    app.editing_field = None;
+                    app.input_buffer.clear();
+                    app.response_scroll = 0;
+                    app.reprocess_streamed_jq();
+                }
+                Some(EditingField::StreamSuffixRegex) => {
+                    let val = app.input_buffer.clone();
+                    if let Some(request) = app.get_current_request_mut() {
+                        request.stream_suffix_regex = val;
+                    }
+                    app.editing_field = None;
+                    app.input_buffer.clear();
+                    app.response_scroll = 0;
+                    app.reprocess_streamed_jq();
                 }
                 Some(EditingField::Headers) => {
                     // If autocomplete is visible, apply selection

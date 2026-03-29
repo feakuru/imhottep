@@ -709,6 +709,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

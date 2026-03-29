@@ -72,7 +72,7 @@ impl fmt::Display for RequestEvent {
     }
 }
 
-/// Represents an HTTP request to be sent
+/// Represents an HTTP request to be saved/loaded and sent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRequest {
     #[serde(with = "http_method_serde")]
@@ -80,7 +80,32 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: HashMap<String, String>,
     pub body: Option<String>,
+    /// jq filter expression used in the Json / StreamedJson response view modes.
+    /// Defaults to "." when absent.
+    #[serde(default = "default_jq_filter", skip_serializing_if = "is_default_jq_filter")]
+    pub jq_filter: String,
+    /// Regex stripped from the start of each streamed line before jq.
+    /// Defaults to r"^\w+:\s*" when absent.
+    #[serde(
+        default = "default_stream_prefix_regex",
+        skip_serializing_if = "is_default_stream_prefix_regex"
+    )]
+    pub stream_prefix_regex: String,
+    /// Regex stripped from the end of each streamed line before jq.
+    /// Defaults to r"\s*$" when absent.
+    #[serde(
+        default = "default_stream_suffix_regex",
+        skip_serializing_if = "is_default_stream_suffix_regex"
+    )]
+    pub stream_suffix_regex: String,
 }
+
+fn default_jq_filter() -> String { ".".to_string() }
+fn is_default_jq_filter(s: &str) -> bool { s == "." }
+fn default_stream_prefix_regex() -> String { r"^\w+:\s*".to_string() }
+fn is_default_stream_prefix_regex(s: &str) -> bool { s == r"^\w+:\s*" }
+fn default_stream_suffix_regex() -> String { r"\s*$".to_string() }
+fn is_default_stream_suffix_regex(s: &str) -> bool { s == r"\s*$" }
 
 impl HttpRequest {
     pub fn new(method: HttpMethod, url: String) -> Self {
@@ -89,6 +114,9 @@ impl HttpRequest {
             url,
             headers: HashMap::new(),
             body: None,
+            jq_filter: default_jq_filter(),
+            stream_prefix_regex: default_stream_prefix_regex(),
+            stream_suffix_regex: default_stream_suffix_regex(),
         }
     }
 

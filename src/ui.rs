@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use crate::app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode};
-use crate::keymap::KeyContext;
+use crate::keymap::{Action, KeyContext};
 
 // ── Small style helpers ───────────────────────────────────────────────────────
 
@@ -132,7 +132,14 @@ fn widget_title(base: &str, app: &App, field: FocusableField) -> String {
         FocusableField::Url => app.editing_field == Some(EditingField::Url),
         FocusableField::Headers => app.editing_field == Some(EditingField::Headers),
         FocusableField::Body => app.editing_field == Some(EditingField::Body),
-        FocusableField::Response => app.editing_field == Some(EditingField::JsonFilter),
+        FocusableField::Response => matches!(
+            app.editing_field,
+            Some(
+                EditingField::JsonFilter
+                    | EditingField::StreamPrefixRegex
+                    | EditingField::StreamSuffixRegex
+            )
+        ),
         FocusableField::RequestEvents => false,
     };
 
@@ -463,7 +470,10 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     // ── Response ──────────────────────────────────────────────────────────────
     let is_response_focused = app.focused_field == FocusableField::Response;
     let is_json_mode = app.response_view_mode == ResponseViewMode::Json;
+    let is_streamed_json_mode = app.response_view_mode == ResponseViewMode::StreamedJson;
     let is_filter_editing = app.editing_field == Some(EditingField::JsonFilter);
+    let is_prefix_editing = app.editing_field == Some(EditingField::StreamPrefixRegex);
+    let is_suffix_editing = app.editing_field == Some(EditingField::StreamSuffixRegex);
 
     // Determine the foreground color from response state, then apply the
     // focus background once rather than repeating it in every branch.
@@ -553,12 +563,8 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut app.response_scroll,
         );
 
-        // Filter bar — title hints come from the keymap, but only show
-        // the filter-edit shortcut when the response panel is focused
-        // (otherwise show nothing extra — the filter bar is not directly
-        // reachable without first focusing Response).
+        // Filter bar
         let filter_title = if is_filter_editing {
-            // Show editing hints
             let ctx = KeyContext {
                 screen: CurrentScreen::Request,
                 editing: Some(EditingField::JsonFilter),
@@ -567,7 +573,6 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             let hint_line = app.keymap.format_hint_line(&ctx);
             format!("jq filter ({hint_line})")
         } else if is_response_focused {
-            // Show the 'f' shortcut so the user knows how to enter edit mode
             let ctx = KeyContext {
                 screen: CurrentScreen::Request,
                 editing: None,
@@ -576,7 +581,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             let bindings = app.keymap.bindings_for(&ctx);
             let filter_hint: Option<String> = bindings
                 .iter()
-                .find(|b| b.action == crate::keymap::Action::EditJqFilter)
+                .find(|b| b.action == Action::EditJqFilter)
                 .map(|b| format!("{} - {}", b.hint, b.description));
             match filter_hint {
                 Some(h) => format!("jq filter ({h})"),
@@ -589,7 +594,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         let filter_display = if is_filter_editing {
             format!("{} [EDITING]", app.input_buffer)
         } else {
-            app.jq_filter.clone()
+            app.current_jq_filter().to_string()
         };
         let filter_style = if is_filter_editing {
             Style::default()
@@ -612,6 +617,149 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             .block(filter_block)
             .style(filter_style);
         frame.render_widget(filter_paragraph, response_chunks[1]);
+    } else if is_streamed_json_mode {
+        // ── StreamedJson mode ─────────────────────────────────────────────────
+        // Split: jq output on top, filter bar (3 fields) at bottom.
+        let is_pending = app.current_request_is_pending();
+        let response_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),    // jq output
+                Constraint::Length(5), // filter bar (3 fields stacked)
+            ])
+            .split(right_chunks[0]);
+
+        // Render jq output (ANSI-coloured)
+        let jq_output = app.current_streamed_jq_output();
+        use ansi_to_tui::IntoText as _;
+        let jq_text = jq_output
+            .as_bytes()
+            .into_text()
+            .unwrap_or_else(|_| Text::raw(jq_output.clone()));
+
+        // Auto-scroll to end while streaming; manual scroll otherwise
+        {
+            let inner = response_block.inner(response_chunks[0]);
+            let visible_lines = inner.height;
+            let line_count = Paragraph::new(jq_text.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width) as u16;
+            let max_scroll = line_count.saturating_sub(visible_lines);
+            if is_pending {
+                app.response_scroll = max_scroll;
+            } else {
+                app.response_scroll = app.response_scroll.min(max_scroll);
+            }
+            let paragraph = Paragraph::new(jq_text)
+                .block(response_block)
+                .wrap(Wrap { trim: false })
+                .scroll((app.response_scroll, 0));
+            frame.render_widget(paragraph, response_chunks[0]);
+            if line_count > visible_lines {
+                let mut scrollbar_state =
+                    ScrollbarState::new(max_scroll as usize).position(app.response_scroll as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("↑"))
+                    .end_symbol(Some("↓"));
+                frame.render_stateful_widget(scrollbar, response_chunks[0], &mut scrollbar_state);
+            }
+        }
+
+        // Filter bar: three rows stacked inside a 5-line area (borders + 3 content lines)
+        let filter_area = response_chunks[1];
+        let filter_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // prefix regex row
+                Constraint::Length(1), // suffix regex row
+                Constraint::Length(1), // jq filter row
+            ])
+            .margin(1) // leave room for the outer border
+            .split(filter_area);
+
+        // Outer border block for the filter area
+        let filter_bar_border = Block::default()
+            .borders(Borders::ALL)
+            .title(
+                if is_response_focused
+                    || is_prefix_editing
+                    || is_suffix_editing
+                    || is_filter_editing
+                {
+                    "filters (f=jq | p=prefix | x=suffix)"
+                } else {
+                    "filters"
+                },
+            )
+            .border_style(
+                if is_prefix_editing || is_suffix_editing || is_filter_editing {
+                    Style::default().fg(Color::Cyan)
+                } else if is_response_focused {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            );
+        frame.render_widget(filter_bar_border, filter_area);
+
+        // Helper closure to build each filter row
+        let make_row =
+            |label: &str, value: &str, is_editing: bool, is_focused: bool| -> Paragraph {
+                let display = if is_editing {
+                    format!("{label}: {value} [EDITING]")
+                } else {
+                    format!("{label}: {value}")
+                };
+                let style = if is_editing {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_focused {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Paragraph::new(display).style(style)
+            };
+
+        let prefix_val = if is_prefix_editing {
+            app.input_buffer.clone()
+        } else {
+            app.current_stream_prefix_regex().to_string()
+        };
+        let suffix_val = if is_suffix_editing {
+            app.input_buffer.clone()
+        } else {
+            app.current_stream_suffix_regex().to_string()
+        };
+        let jq_val = if is_filter_editing {
+            app.input_buffer.clone()
+        } else {
+            app.current_jq_filter().to_string()
+        };
+
+        frame.render_widget(
+            make_row(
+                "prefix",
+                &prefix_val,
+                is_prefix_editing,
+                is_response_focused,
+            ),
+            filter_rows[0],
+        );
+        frame.render_widget(
+            make_row(
+                "suffix",
+                &suffix_val,
+                is_suffix_editing,
+                is_response_focused,
+            ),
+            filter_rows[1],
+        );
+        frame.render_widget(
+            make_row("jq   ", &jq_val, is_filter_editing, is_response_focused),
+            filter_rows[2],
+        );
     } else {
         // Plain text mode (or pending / no response)
         let response_text = if app.current_request_is_pending() {
@@ -760,6 +908,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                                 | crate::keymap::Action::SelectNextHeader
                                 | crate::keymap::Action::SelectPreviousHeader
                                 | crate::keymap::Action::EditJqFilter
+                                | crate::keymap::Action::EditStreamPrefixRegex
+                                | crate::keymap::Action::EditStreamSuffixRegex
                         )
                     })
                     .map(|b| format!("{} - {}", b.hint, b.description))
