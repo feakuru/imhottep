@@ -11,10 +11,12 @@ use ratatui::{
 };
 
 mod app;
+mod keymap;
 pub mod http_client;
 mod ui;
 use crate::{
     app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode},
+    keymap::Action,
     ui::ui,
 };
 
@@ -89,151 +91,22 @@ where
             if key.kind == event::KeyEventKind::Release {
                 continue;
             }
-            match app.current_screen {
-                CurrentScreen::Main => match key.code {
-                    KeyCode::Char('n') => {
-                        app.create_new_request();
-                    }
-                    KeyCode::Char('d') => {
-                        app.delete_current_request();
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        app.select_next_request();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        app.select_previous_request();
-                    }
-                    KeyCode::Char('e') | KeyCode::Enter => {
-                        if app.get_current_request().is_some() {
-                            app.current_screen = CurrentScreen::Request;
-                            app.editing_field = None;
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        app.save_requests();
-                    }
-                    KeyCode::Char('q') => {
-                        app.current_screen = CurrentScreen::Exiting;
-                    }
-                    _ => {}
-                },
-                CurrentScreen::Exiting => match key.code {
-                    KeyCode::Char('y') | KeyCode::Enter => {
-                        return Ok(false);
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
-                        app.current_screen = CurrentScreen::Main;
-                    }
-                    _ => {}
-                },
-                CurrentScreen::Request => {
-                    if let Some(editing) = app.editing_field {
-                        // Handle input while editing a field
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.editing_field = None;
-                                app.input_buffer.clear();
-                                app.header_key_buffer.clear();
-                                app.header_value_buffer.clear();
-                                app.editing_header_key = true;
-                                app.editing_existing_header = None;
-                                app.header_autocomplete_visible = false;
-                                app.header_autocomplete_selected = 0;
-                            }
-                            KeyCode::Tab | KeyCode::BackTab => {
-                                // Toggle between header name and value fields
-                                if editing == EditingField::Headers {
-                                    app.editing_header_key = !app.editing_header_key;
-                                    app.header_autocomplete_visible = app.editing_header_key;
-                                    app.header_autocomplete_selected = 0;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                match editing {
-                                    EditingField::Url => {
-                                        let url = app.input_buffer.clone();
-                                        if let Some(request) = app.get_current_request_mut() {
-                                            request.url = url;
-                                        }
-                                        app.editing_field = None;
-                                        app.input_buffer.clear();
-                                    }
-                                    EditingField::Body => {
-                                        // Allow newlines in body
-                                        app.input_buffer.push('\n');
-                                    }
-                                    EditingField::JsonFilter => {
-                                        // Confirm the filter and leave edit mode
-                                        app.jq_filter = app.input_buffer.clone();
-                                        app.editing_field = None;
-                                        app.input_buffer.clear();
-                                        app.response_scroll = 0;
-                                    }
-                                    EditingField::Headers => {
-                                        // If autocomplete is visible, apply selection
-                                        if app.header_autocomplete_visible {
-                                            let suggestions = app.get_filtered_header_suggestions();
-                                            app.apply_autocomplete_selection(&suggestions);
-                                        } else if app.editing_header_key {
-                                            // Move to value field
-                                            app.editing_header_key = false;
-                                        } else {
-                                            // Save header
-                                            let key = app.header_key_buffer.clone();
-                                            let value = app.header_value_buffer.clone();
-                                            let old_key = app.editing_existing_header.clone();
 
-                                            if let Some(request) = app.get_current_request_mut() {
-                                                if !key.is_empty() {
-                                                    // If editing an existing header, remove the old one first
-                                                    if let Some(ref old_key) = old_key {
-                                                        request.remove_header(old_key);
-                                                    }
-                                                    request.add_header(key, value);
-                                                }
-                                            }
-                                            app.editing_field = None;
-                                            app.header_key_buffer.clear();
-                                            app.header_value_buffer.clear();
-                                            app.editing_header_key = true;
-                                            app.editing_existing_header = None;
-                                            app.header_autocomplete_visible = false;
-                                            app.header_autocomplete_selected = 0;
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Down => {
-                                // Navigate autocomplete suggestions
-                                if editing == EditingField::Headers
-                                    && app.header_autocomplete_visible
-                                {
-                                    let suggestions = app.get_filtered_header_suggestions();
-                                    app.select_next_autocomplete(suggestions.len());
-                                }
-                            }
-                            KeyCode::Up => {
-                                // Navigate autocomplete suggestions
-                                if editing == EditingField::Headers
-                                    && app.header_autocomplete_visible
-                                {
-                                    app.select_previous_autocomplete();
-                                }
-                            }
-                            KeyCode::Char('s')
-                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                            {
-                                // Ctrl+S to save body
-                                if editing == EditingField::Body {
-                                    let body = app.input_buffer.clone();
-                                    if let Some(request) = app.get_current_request_mut() {
-                                        request.set_body(body);
-                                    }
-                                    app.editing_field = None;
-                                    app.input_buffer.clear();
-                                }
-                            }
-                            KeyCode::Char(c) => match editing {
+            let ctx = app.key_context();
+
+            // Check if this is a typed character that should go to the input
+            // buffer (not handled by the keymap). We only do this in editing mode.
+            let is_editing = app.editing_field.is_some();
+            if is_editing {
+                if let KeyCode::Char(c) = key.code {
+                    // Only treat as input if it's not a keymap-bound action.
+                    // Ctrl+C and Ctrl+S are bound; plain chars are input.
+                    if key.modifiers == event::KeyModifiers::NONE
+                        || key.modifiers == event::KeyModifiers::SHIFT
+                    {
+                        // Route the character to the appropriate buffer.
+                        if let Some(editing) = app.editing_field {
+                            match editing {
                                 EditingField::Headers => {
                                     if app.editing_header_key {
                                         app.header_key_buffer.push(c);
@@ -245,123 +118,249 @@ where
                                 _ => {
                                     app.input_buffer.push(c);
                                 }
-                            },
-                            KeyCode::Backspace => match editing {
-                                EditingField::Headers => {
-                                    if app.editing_header_key {
-                                        app.header_key_buffer.pop();
-                                        app.header_autocomplete_selected = 0;
-                                    } else {
-                                        app.header_value_buffer.pop();
-                                    }
-                                }
-                                _ => {
-                                    app.input_buffer.pop();
-                                }
-                            },
-                            _ => {}
+                            }
                         }
-                    } else {
-                        // Navigation mode in Request screen
-                        match key.code {
-                            KeyCode::Tab => {
-                                app.focus_next_field();
-                            }
-                            KeyCode::BackTab => {
-                                app.focus_previous_field();
-                            }
-                            KeyCode::Char('e') | KeyCode::Enter => {
-                                // If focused on headers, edit the selected one
-                                if app.focused_field == FocusableField::Headers {
-                                    app.edit_selected_header();
-                                } else {
-                                    app.edit_focused_field();
-                                }
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                // If focused on headers, navigate header list
-                                if app.focused_field == FocusableField::Headers {
-                                    app.select_next_header();
-                                } else {
-                                    app.scroll_down(1);
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                // If focused on headers, navigate header list
-                                if app.focused_field == FocusableField::Headers {
-                                    app.select_previous_header();
-                                } else {
-                                    app.scroll_up(1);
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                // If focused on headers, navigate header list
-                                if app.focused_field == FocusableField::Headers {
-                                    app.select_next_header();
-                                } else {
-                                    app.scroll_down(30);
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                // If focused on headers, navigate header list
-                                if app.focused_field == FocusableField::Headers {
-                                    app.select_previous_header();
-                                } else {
-                                    app.scroll_up(30);
-                                }
-                            }
-                            KeyCode::Char('a') => {
-                                // Add new header (only when focused on headers)
-                                if app.focused_field == FocusableField::Headers {
-                                    app.edit_focused_field();
-                                }
-                            }
-                            KeyCode::Char('d') => {
-                                // Delete selected header
-                                if app.focused_field == FocusableField::Headers {
-                                    app.delete_selected_header();
-                                }
-                            }
-                            KeyCode::Esc | KeyCode::Char('q') => {
-                                app.reset_request_screen_state();
-                                app.current_screen = CurrentScreen::Main;
-                            }
-                            KeyCode::Char('u') => {
-                                app.focused_field = FocusableField::Url;
-                                app.edit_focused_field();
-                            }
-                            KeyCode::Char('m') => {
-                                app.toggle_method();
-                            }
-                            KeyCode::Char('h') => {
-                                app.focused_field = FocusableField::Headers;
-                            }
-                            KeyCode::Char('b') => {
-                                app.focused_field = FocusableField::Body;
-                                app.edit_focused_field();
-                            }
-                            KeyCode::Char('s') => {
-                                app.send_current_request();
-                            }
-                            KeyCode::Char('v') => {
-                                // Cycle response view mode (json mode only if body is valid json)
-                                app.cycle_response_view_mode();
-                                app.response_scroll = 0;
-                            }
-                            KeyCode::Char('f') => {
-                                // Edit jq filter (only when response panel is focused in json mode)
-                                if app.focused_field == FocusableField::Response
-                                    && app.response_view_mode == ResponseViewMode::Json
-                                {
-                                    app.input_buffer = app.jq_filter.clone();
-                                    app.editing_field = Some(EditingField::JsonFilter);
-                                }
-                            }
-                            _ => {}
-                        }
+                        continue;
                     }
+                }
+            }
+
+            if let Some(action) = app.keymap.resolve(&ctx, &key) {
+                if !execute_action(app, action)? {
+                    return Ok(false);
                 }
             }
         }
     }
+}
+
+/// Execute an action and return `Ok(true)` to continue the loop, or
+/// `Ok(false)` to terminate the application.
+fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
+    match action {
+        // ── Global ────────────────────────────────────────────────────────────
+        Action::TriggerExit => {
+            app.current_screen = CurrentScreen::Exiting;
+        }
+
+        // ── Main screen ───────────────────────────────────────────────────────
+        Action::NewRequest => {
+            app.create_new_request();
+        }
+        Action::DeleteRequest => {
+            app.delete_current_request();
+        }
+        Action::SelectNextRequest => {
+            app.select_next_request();
+        }
+        Action::SelectPreviousRequest => {
+            app.select_previous_request();
+        }
+        Action::EditRequest => {
+            if app.get_current_request().is_some() {
+                app.current_screen = CurrentScreen::Request;
+                app.editing_field = None;
+            }
+        }
+        Action::SaveRequests => {
+            app.save_requests();
+        }
+
+        // ── Exit confirmation ─────────────────────────────────────────────────
+        Action::ConfirmExit => {
+            return Ok(false);
+        }
+        Action::CancelExit => {
+            app.current_screen = CurrentScreen::Main;
+        }
+
+        // ── Request screen — navigation ───────────────────────────────────────
+        Action::FocusNextField => {
+            app.focus_next_field();
+        }
+        Action::FocusPreviousField => {
+            app.focus_previous_field();
+        }
+        Action::EditFocusedField => {
+            app.edit_focused_field();
+        }
+        Action::EditSelectedHeader => {
+            app.edit_selected_header();
+        }
+        Action::ScrollDown => {
+            app.scroll_down(1);
+        }
+        Action::ScrollUp => {
+            app.scroll_up(1);
+        }
+        Action::PageDown => {
+            app.scroll_down(30);
+        }
+        Action::PageUp => {
+            app.scroll_up(30);
+        }
+        Action::GoBack => {
+            app.reset_request_screen_state();
+            app.current_screen = CurrentScreen::Main;
+        }
+        Action::AddHeader => {
+            if app.focused_field == FocusableField::Headers {
+                app.edit_focused_field();
+            }
+        }
+        Action::DeleteHeader => {
+            if app.focused_field == FocusableField::Headers {
+                app.delete_selected_header();
+            }
+        }
+        Action::SelectNextHeader => {
+            app.select_next_header();
+        }
+        Action::SelectPreviousHeader => {
+            app.select_previous_header();
+        }
+        Action::ToggleMethod => {
+            app.toggle_method();
+        }
+        Action::JumpToUrl => {
+            app.focused_field = FocusableField::Url;
+            app.edit_focused_field();
+        }
+        Action::FocusHeaders => {
+            app.focused_field = FocusableField::Headers;
+        }
+        Action::JumpToBody => {
+            app.focused_field = FocusableField::Body;
+            app.edit_focused_field();
+        }
+        Action::SendRequest => {
+            app.send_current_request();
+        }
+        Action::CycleViewMode => {
+            app.cycle_response_view_mode();
+            app.response_scroll = 0;
+        }
+        Action::EditJqFilter => {
+            if app.focused_field == FocusableField::Response
+                && app.response_view_mode == ResponseViewMode::Json
+            {
+                app.input_buffer = app.jq_filter.clone();
+                app.editing_field = Some(EditingField::JsonFilter);
+            }
+        }
+
+        // ── Editing mode ──────────────────────────────────────────────────────
+        Action::CancelEdit => {
+            app.editing_field = None;
+            app.input_buffer.clear();
+            app.header_key_buffer.clear();
+            app.header_value_buffer.clear();
+            app.editing_header_key = true;
+            app.editing_existing_header = None;
+            app.header_autocomplete_visible = false;
+            app.header_autocomplete_selected = 0;
+        }
+        Action::ConfirmEdit => {
+            match app.editing_field {
+                Some(EditingField::Url) => {
+                    let url = app.input_buffer.clone();
+                    if let Some(request) = app.get_current_request_mut() {
+                        request.url = url;
+                    }
+                    app.editing_field = None;
+                    app.input_buffer.clear();
+                }
+                Some(EditingField::JsonFilter) => {
+                    app.jq_filter = app.input_buffer.clone();
+                    app.editing_field = None;
+                    app.input_buffer.clear();
+                    app.response_scroll = 0;
+                }
+                Some(EditingField::Headers) => {
+                    // If autocomplete is visible, apply selection
+                    if app.header_autocomplete_visible {
+                        let suggestions = app.get_filtered_header_suggestions();
+                        app.apply_autocomplete_selection(&suggestions);
+                    } else if app.editing_header_key {
+                        // Move to value field
+                        app.editing_header_key = false;
+                        app.header_autocomplete_visible = false;
+                    } else {
+                        // Save header
+                        let key = app.header_key_buffer.clone();
+                        let value = app.header_value_buffer.clone();
+                        let old_key = app.editing_existing_header.clone();
+                        if let Some(request) = app.get_current_request_mut() {
+                            if !key.is_empty() {
+                                if let Some(ref old_key) = old_key {
+                                    request.remove_header(old_key);
+                                }
+                                request.add_header(key, value);
+                            }
+                        }
+                        app.editing_field = None;
+                        app.header_key_buffer.clear();
+                        app.header_value_buffer.clear();
+                        app.editing_header_key = true;
+                        app.editing_existing_header = None;
+                        app.header_autocomplete_visible = false;
+                        app.header_autocomplete_selected = 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Action::ToggleHeaderKeyValue => {
+            if app.editing_field == Some(EditingField::Headers) {
+                app.editing_header_key = !app.editing_header_key;
+                app.header_autocomplete_visible = app.editing_header_key;
+                app.header_autocomplete_selected = 0;
+            }
+        }
+        Action::InsertNewline => {
+            app.input_buffer.push('\n');
+        }
+        Action::SaveBody => {
+            let body = app.input_buffer.clone();
+            if let Some(request) = app.get_current_request_mut() {
+                request.set_body(body);
+            }
+            app.editing_field = None;
+            app.input_buffer.clear();
+        }
+        Action::DeleteChar => {
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            app.header_key_buffer.pop();
+                            app.header_autocomplete_selected = 0;
+                        } else {
+                            app.header_value_buffer.pop();
+                        }
+                    }
+                    _ => {
+                        app.input_buffer.pop();
+                    }
+                }
+            }
+        }
+        Action::AutocompleteDown => {
+            if app.editing_field == Some(EditingField::Headers)
+                && app.header_autocomplete_visible
+            {
+                let suggestions = app.get_filtered_header_suggestions();
+                app.select_next_autocomplete(suggestions.len());
+            }
+        }
+        Action::AutocompleteUp => {
+            if app.editing_field == Some(EditingField::Headers)
+                && app.header_autocomplete_visible
+            {
+                app.select_previous_autocomplete();
+            }
+        }
+    }
+
+    Ok(true)
 }

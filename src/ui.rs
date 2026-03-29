@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode};
+use crate::keymap::KeyContext;
 
 // ── Small style helpers ───────────────────────────────────────────────────────
 
@@ -136,6 +137,76 @@ fn render_scrollable_text(
     }
 }
 
+// ── Title helper ──────────────────────────────────────────────────────────────
+
+/// Build a block title for a widget:
+/// - When `editing`: appends the editing-mode hints from the keymap.
+/// - When `focused`: appends the focused-navigation hints from the keymap.
+/// - When neither (unfocused/not editing): appends the focus-jump shortcut for
+///   this field (e.g. `"u=edit URL"`) so the user can always see how to jump
+///   to any field.
+fn widget_title(base: &str, app: &App, field: FocusableField) -> String {
+    let is_focused = app.focused_field == field;
+    let editing_this_field = match field {
+        FocusableField::Url => app.editing_field == Some(EditingField::Url),
+        FocusableField::Headers => app.editing_field == Some(EditingField::Headers),
+        FocusableField::Body => app.editing_field == Some(EditingField::Body),
+        FocusableField::Response => app.editing_field == Some(EditingField::JsonFilter),
+        FocusableField::RequestEvents => false,
+    };
+
+    if editing_this_field {
+        // Show hints for the current editing context — field-specific only
+        let editing_field = app.editing_field.unwrap();
+        let ctx = KeyContext {
+            screen: CurrentScreen::Request,
+            editing: Some(editing_field),
+            focus: field,
+        };
+        let bindings = app.keymap.field_bindings_for(&ctx);
+        let hint_line = bindings
+            .iter()
+            .map(|b| format!("{} - {}", b.hint, b.description))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if hint_line.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base} ({hint_line})")
+        }
+    } else if is_focused {
+        // Show field-specific navigation hints only (not the global tab/q/m/s etc.)
+        let ctx = KeyContext {
+            screen: CurrentScreen::Request,
+            editing: None,
+            focus: field,
+        };
+        let bindings = app.keymap.field_bindings_for(&ctx);
+        let hint_line = bindings
+            .iter()
+            .map(|b| format!("{} - {}", b.hint, b.description))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if hint_line.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base} ({hint_line})")
+        }
+    } else {
+        // Show focus-jump shortcut (always visible so user knows how to reach the field)
+        let shortcuts = app.keymap.focus_shortcut_for_field(field);
+        if shortcuts.is_empty() {
+            base.to_string()
+        } else {
+            let parts: Vec<String> = shortcuts
+                .iter()
+                .map(|(hint, desc)| format!("{hint}={desc}"))
+                .collect();
+            format!("{base} ({})", parts.join(", "))
+        }
+    }
+}
+
 // ── Top-level entry point ─────────────────────────────────────────────────────
 
 pub fn ui(frame: &mut Frame, app: &mut App) {
@@ -253,9 +324,10 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
     };
 
+    let url_title = widget_title("Method & URL", app, FocusableField::Url);
     let method_url_block = Block::default()
         .borders(Borders::ALL)
-        .title("Method & URL (m=method, e/enter=edit url)")
+        .title(url_title)
         .border_style(focused_border_style(is_url_focused));
 
     let method_url = Paragraph::new(method_url_text)
@@ -282,9 +354,10 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push(format!("Value: {} [EDITING]", app.header_value_buffer));
         }
 
+        let headers_title = widget_title("Headers", app, FocusableField::Headers);
         let headers_block = Block::default()
             .borders(Borders::ALL)
-            .title("Headers (tab=cycle name/val, enter=confirm, esc=cancel)")
+            .title(headers_title)
             .border_style(Style::default().fg(Color::Cyan));
 
         let headers = Paragraph::new(lines.join("\n"))
@@ -328,12 +401,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect();
 
-        let headers_title = if is_headers_focused {
-            "Headers (a=add, e=edit, d=delete, ↑/↓=select)"
-        } else {
-            "Headers"
-        };
-
+        let headers_title = widget_title("Headers", app, FocusableField::Headers);
         let headers_block = Block::default()
             .borders(Borders::ALL)
             .title(headers_title)
@@ -347,10 +415,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_body_editing = app.editing_field == Some(EditingField::Body);
 
     let body_text = if is_body_editing {
-        format!(
-            "{} [EDITING - Ctrl+S to save, ESC to cancel]",
-            app.input_buffer
-        )
+        format!("{} [EDITING - ^S to save, esc to cancel]", app.input_buffer)
     } else {
         request.body.as_deref().unwrap_or("(no body)").to_string()
     };
@@ -365,9 +430,10 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
     };
 
+    let body_title = widget_title("Body", app, FocusableField::Body);
     let body_block = Block::default()
         .borders(Borders::ALL)
-        .title("Body (e/enter=edit)")
+        .title(body_title)
         .border_style(focused_border_style(is_body_focused));
 
     render_scrollable_paragraph(
@@ -505,7 +571,39 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut app.response_scroll,
         );
 
-        // Filter bar
+        // Filter bar — title hints come from the keymap, but only show
+        // the filter-edit shortcut when the response panel is focused
+        // (otherwise show nothing extra — the filter bar is not directly
+        // reachable without first focusing Response).
+        let filter_title = if is_filter_editing {
+            // Show editing hints
+            let ctx = KeyContext {
+                screen: CurrentScreen::Request,
+                editing: Some(EditingField::JsonFilter),
+                focus: FocusableField::Response,
+            };
+            let hint_line = app.keymap.format_hint_line(&ctx);
+            format!("jq filter ({hint_line})")
+        } else if is_response_focused {
+            // Show the 'f' shortcut so the user knows how to enter edit mode
+            let ctx = KeyContext {
+                screen: CurrentScreen::Request,
+                editing: None,
+                focus: FocusableField::Response,
+            };
+            let bindings = app.keymap.bindings_for(&ctx);
+            let filter_hint: Option<String> = bindings
+                .iter()
+                .find(|b| b.action == crate::keymap::Action::EditJqFilter)
+                .map(|b| format!("{} - {}", b.hint, b.description));
+            match filter_hint {
+                Some(h) => format!("jq filter ({h})"),
+                None => "jq filter".to_string(),
+            }
+        } else {
+            "jq filter".to_string()
+        };
+
         let filter_display = if is_filter_editing {
             format!("{} [EDITING]", app.input_buffer)
         } else {
@@ -522,7 +620,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let filter_block = Block::default()
             .borders(Borders::ALL)
-            .title("jq filter (f=edit, enter=apply, esc=cancel)")
+            .title(filter_title)
             .border_style(if is_filter_editing {
                 Style::default().fg(Color::Cyan)
             } else {
@@ -622,65 +720,100 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mode_footer = Paragraph::new(Line::from(current_navigation_text).centered())
         .block(Block::default().borders(Borders::ALL));
 
-    let key_notes_footer = (match app.current_screen {
-        CurrentScreen::Main => Paragraph::new(vec![
-            Line::from("↓↑/jk - select | n - new | d - delete").centered(),
-            Line::from(
-                if let Some(status) = &app.last_save_status {
-                    status.as_str()
-                } else {
-                    "s - save | enter - edit | q - quit"
-                }
-            ).centered(),
-        ])
-        .style(Style::default().fg(Color::Yellow)),
+    let ctx = app.key_context();
+    let key_notes_footer = match app.current_screen {
+        CurrentScreen::Main => {
+            let hint_line = app.keymap.format_hint_line(&ctx);
+            let mut lines = vec![Line::from(hint_line).centered()];
+            // Show save status on a second line when present
+            if let Some(status) = &app.last_save_status {
+                lines.push(Line::from(status.clone()).centered());
+            }
+            Paragraph::new(lines).style(Style::default().fg(Color::Yellow))
+        }
         CurrentScreen::Request => {
             if app.editing_field.is_some() {
-                let edit_hint = match app.editing_field.unwrap() {
-                                    EditingField::Body => "type to edit | Ctrl+S - save | esc - cancel",
-                                    EditingField::Headers => {
-                                        if app.editing_header_key {
-                                            "type header key | tab - next | ↓↑ - select | enter - confirm | esc - cancel"
-                                        } else {
-                                            "type header value | ⇧tab - prev | enter - confirm | esc - cancel"
-                                        }
-                                    }
-                                    EditingField::Url => "type URL | enter - confirm | esc - cancel",
-                                    EditingField::JsonFilter => "type jq filter | enter - apply | esc - cancel",
-                                };
-                Paragraph::new(Line::from(edit_hint).centered())
+                // Single line: editing hints
+                let hint_line = app.keymap.format_hint_line(&ctx);
+                Paragraph::new(Line::from(hint_line).centered())
                     .style(Style::default().fg(Color::Cyan))
             } else {
-                let field_hints = match app.focused_field {
-                    FocusableField::Url => "u - edit URL | tab - next field",
-                    FocusableField::Headers => "a - add | d - delete | ↓↑/jk - navigate",
-                    FocusableField::Body => "↓↑/jk - scroll",
-                    FocusableField::RequestEvents => "↓↑/jk - scroll",
-                    FocusableField::Response => {
-                        if app.response_view_mode == ResponseViewMode::Json {
-                            "↓↑/jk - scroll | v - text mode | f - edit jq filter"
-                        } else if app.is_response_json() {
-                            "↓↑/jk - scroll | v - json mode"
-                        } else {
-                            "↓↑/jk - scroll"
-                        }
-                    }
-                };
+                // Three lines:
+                //   1. field-navigation globals (tab, shift+tab)
+                //   2. current-field-specific hints
+                //   3. global request actions (m, s, v, q)
+                //
+                // We split the hints into groups for readability.
+                let all_bindings = app.keymap.bindings_for(&ctx);
+
+                // Line 1: tab/shift+tab navigation
+                let nav_hints: String = all_bindings
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b.action,
+                            crate::keymap::Action::FocusNextField
+                                | crate::keymap::Action::FocusPreviousField
+                        )
+                    })
+                    .map(|b| format!("{} - {}", b.hint, b.description))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                // Line 2: field-specific scroll/edit/header actions
+                let field_hints: String = all_bindings
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b.action,
+                            crate::keymap::Action::ScrollDown
+                                | crate::keymap::Action::ScrollUp
+                                | crate::keymap::Action::PageDown
+                                | crate::keymap::Action::PageUp
+                                | crate::keymap::Action::EditFocusedField
+                                | crate::keymap::Action::EditSelectedHeader
+                                | crate::keymap::Action::AddHeader
+                                | crate::keymap::Action::DeleteHeader
+                                | crate::keymap::Action::SelectNextHeader
+                                | crate::keymap::Action::SelectPreviousHeader
+                                | crate::keymap::Action::EditJqFilter
+                        )
+                    })
+                    .map(|b| format!("{} - {}", b.hint, b.description))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                // Line 3: global request actions
+                let global_hints: String = all_bindings
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b.action,
+                            crate::keymap::Action::ToggleMethod
+                                | crate::keymap::Action::SendRequest
+                                | crate::keymap::Action::CycleViewMode
+                                | crate::keymap::Action::GoBack
+                                | crate::keymap::Action::TriggerExit
+                        )
+                    })
+                    .map(|b| format!("{} - {}", b.hint, b.description))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
 
                 Paragraph::new(vec![
-                    Line::from("tab/⇧tab - navigate fields | e/enter - edit").centered(),
+                    Line::from(nav_hints).centered(),
                     Line::from(field_hints).centered(),
-                    Line::from("m - choose method | s - send request | q - back to list")
-                        .centered(),
+                    Line::from(global_hints).centered(),
                 ])
                 .style(Style::default().fg(Color::Yellow))
             }
         }
         CurrentScreen::Exiting => {
-            Paragraph::new(Line::from("y/enter - yes | n/q/esc - no").centered())
+            let hint_line = app.keymap.format_hint_line(&ctx);
+            Paragraph::new(Line::from(hint_line).centered())
                 .style(Style::default().fg(Color::Yellow))
         }
-    })
+    }
     .block(Block::default().borders(Borders::ALL));
 
     let footer_chunks = Layout::default()

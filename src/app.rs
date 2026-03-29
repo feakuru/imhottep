@@ -1,4 +1,5 @@
 use crate::http_client::{HttpRequest, HttpResponse, HttpRuntime, RequestEvent};
+use crate::keymap::{KeyContext, Keymap};
 use hyper::Method;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
@@ -75,6 +76,8 @@ pub struct App {
     pub response_scroll: u16,
     // Last save status message (shown briefly in the footer)
     pub last_save_status: Option<String>,
+    // Keybinding map (single source of truth for dispatch + hints)
+    pub keymap: Keymap,
 }
 
 impl App {
@@ -108,6 +111,7 @@ impl App {
             response_scroll: 0,
             streamed_body: String::new(),
             last_save_status: None,
+            keymap: Keymap::default(),
         }
     }
 
@@ -437,6 +441,15 @@ impl App {
         }
     }
 
+    /// Returns the current key context for keymap resolution and hint display.
+    pub fn key_context(&self) -> KeyContext {
+        KeyContext {
+            screen: self.current_screen,
+            editing: self.editing_field,
+            focus: self.focused_field,
+        }
+    }
+
     pub fn reset_request_screen_state(&mut self) {
         // Reset editing state
         self.editing_field = None;
@@ -705,6 +718,7 @@ mod tests {
             response_scroll: 0,
             streamed_body: String::new(),
             last_save_status: None,
+            keymap: Keymap::default(),
         }
     }
 
