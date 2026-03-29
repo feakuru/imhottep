@@ -33,21 +33,6 @@ fn selected_item_style() -> Style {
 
 // ── Layout / rendering helpers ────────────────────────────────────────────────
 
-/// Counts how many terminal rows `text` will occupy when soft-wrapped to
-/// `inner_width` columns.
-fn count_wrapped_lines(text: &str, inner_width: usize) -> u16 {
-    text.lines()
-        .map(|line| {
-            let len = line.len();
-            if len == 0 {
-                1u16
-            } else {
-                ((len + inner_width - 1) / inner_width) as u16
-            }
-        })
-        .sum()
-}
-
 /// Renders a scrollable, word-wrapped `Paragraph` with an optional vertical
 /// scrollbar.  If `auto_scroll_end` is true the scroll position is set to the
 /// last visible line (useful for live-updating windows where new data should
@@ -64,9 +49,14 @@ fn render_scrollable_paragraph(
 ) {
     let inner = block.inner(area);
     let visible_lines = inner.height;
-    let inner_width = inner.width.max(1) as usize;
 
-    let line_count = count_wrapped_lines(&text, inner_width);
+    // Use a block-less paragraph for line counting so that line_count()
+    // returns the pure text row count using the inner (content) width.
+    let line_count = Paragraph::new(text.as_str())
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width) as u16;
+
     let max_scroll = line_count.saturating_sub(visible_lines);
     if auto_scroll_end {
         *scroll = max_scroll;
@@ -77,8 +67,8 @@ fn render_scrollable_paragraph(
     let paragraph = Paragraph::new(text)
         .block(block)
         .style(style)
-        .scroll((*scroll, 0))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((*scroll, 0));
     frame.render_widget(paragraph, area);
 
     if line_count > visible_lines {
@@ -102,29 +92,20 @@ fn render_scrollable_text(
 ) {
     let inner = block.inner(area);
     let visible_lines = inner.height;
-    let inner_width = inner.width.max(1) as usize;
 
-    // Count wrapped lines by summing each line's wrapped height
-    let line_count: u16 = text
-        .lines
-        .iter()
-        .map(|line| {
-            let len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-            if len == 0 {
-                1u16
-            } else {
-                ((len + inner_width - 1) / inner_width) as u16
-            }
-        })
-        .sum();
+    // Use a block-less paragraph for line counting so that line_count()
+    // returns the pure text row count using the inner (content) width.
+    let line_count = Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width) as u16;
 
     let max_scroll = line_count.saturating_sub(visible_lines);
     *scroll = (*scroll).min(max_scroll);
 
     let paragraph = Paragraph::new(text)
         .block(block)
-        .scroll((*scroll, 0))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((*scroll, 0));
     frame.render_widget(paragraph, area);
 
     if line_count > visible_lines {
@@ -443,11 +424,12 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         body_style,
         left_chunks[2],
         &mut app.body_scroll,
-        true,
+        is_body_editing,
     );
 
     // ── Request Events ────────────────────────────────────────────────────────
     let is_events_focused = app.focused_field == FocusableField::RequestEvents;
+    let is_request_pending = app.current_request_is_pending();
 
     let events_text = if app.current_request_events().is_empty() {
         "(no events yet)".to_string()
@@ -455,7 +437,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         app.current_request_events().join("\n")
     };
 
-    let events_style = if app.current_request_is_pending() {
+    let events_style = if is_request_pending {
         Style::default().fg(Color::Cyan)
     } else if is_events_focused {
         Style::default().fg(Color::Gray).bg(Color::DarkGray)
@@ -475,7 +457,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         events_style,
         right_chunks[1],
         &mut app.events_scroll,
-        true,
+        is_request_pending,
     );
 
     // ── Response ──────────────────────────────────────────────────────────────
@@ -668,7 +650,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             response_style,
             right_chunks[0],
             &mut app.response_scroll,
-            true,
+            false,
         );
     }
 
@@ -875,66 +857,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use ratatui::style::Color;
-
-    // ── count_wrapped_lines ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_count_wrapped_lines_empty_string() {
-        // An empty string has zero logical lines, so sum is 0
-        assert_eq!(count_wrapped_lines("", 80), 0);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_single_short_line() {
-        assert_eq!(count_wrapped_lines("hello", 80), 1);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_exactly_fits() {
-        // 10 chars, width 10 → 1 row
-        assert_eq!(count_wrapped_lines("1234567890", 10), 1);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_wraps_to_two_rows() {
-        // 11 chars in a width-10 box → 2 rows
-        assert_eq!(count_wrapped_lines("12345678901", 10), 2);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_empty_physical_line_counts_as_one() {
-        // str::lines() treats a trailing newline as the end of the single preceding
-        // empty line, so "\n" produces exactly 1 row.
-        let text = "\n";
-        assert_eq!(count_wrapped_lines(text, 80), 1);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_two_newlines_give_two_lines() {
-        // Two logical lines separated by a newline
-        let text = "a\nb";
-        assert_eq!(count_wrapped_lines(text, 80), 2);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_multiple_short_lines() {
-        let text = "line1\nline2\nline3";
-        assert_eq!(count_wrapped_lines(text, 80), 3);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_long_line_wraps_multiple_times() {
-        // 30 chars, width 10 → 3 rows
-        let text = "a".repeat(30);
-        assert_eq!(count_wrapped_lines(&text, 10), 3);
-    }
-
-    #[test]
-    fn test_count_wrapped_lines_mixed_long_and_short() {
-        // 20-char line (2 rows at width 10) + 5-char line (1 row)
-        let text = format!("{}\n{}", "x".repeat(20), "short");
-        assert_eq!(count_wrapped_lines(&text, 10), 3);
-    }
 
     // ── centered_rect ─────────────────────────────────────────────────────────
 
