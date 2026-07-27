@@ -11,8 +11,8 @@ use ratatui::{
 };
 
 mod app;
-mod keymap;
 pub mod http_client;
+mod keymap;
 mod ui;
 pub mod uv_client;
 use crate::{
@@ -395,17 +395,13 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             }
         }
         Action::AutocompleteDown => {
-            if app.editing_field == Some(EditingField::Headers)
-                && app.header_autocomplete_visible
-            {
+            if app.editing_field == Some(EditingField::Headers) && app.header_autocomplete_visible {
                 let suggestions = app.get_filtered_header_suggestions();
                 app.select_next_autocomplete(suggestions.len());
             }
         }
         Action::AutocompleteUp => {
-            if app.editing_field == Some(EditingField::Headers)
-                && app.header_autocomplete_visible
-            {
+            if app.editing_field == Some(EditingField::Headers) && app.header_autocomplete_visible {
                 app.select_previous_autocomplete();
             }
         }
