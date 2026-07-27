@@ -20,6 +20,8 @@ hyper-tls = "0.6"
 ansi-to-tui = "8.0.1"
 regex = "1"
 unicode-width = "0.2"
+url = "2"
+smallvec = { version = "1", features = ["const_new", "union"] }
 
 [dev-dependencies]
 tempfile = "3"

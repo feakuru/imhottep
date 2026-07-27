@@ -1,11 +1,126 @@
-use crate::http_client::{HttpRequest, HttpResponse, HttpRuntime, RequestEvent};
+use crate::http_client::{
+    HttpError, HttpRequest, HttpResponse, HttpRuntime, RequestEvent,
+};
 use crate::keymap::{KeyContext, Keymap};
 use hyper::Method;
-use regex::Regex;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
+
+/// Sentinel value meaning "scroll to the last line on next render".
+/// The renderer clamps scroll values to `max_scroll`, so any value larger
+/// than the actual content height achieves the same effect.
+pub const SCROLL_TO_END: u16 = u16::MAX;
+
+// ── Word-boundary helpers ─────────────────────────────────────────────────────
+
+/// Find the byte offset of the word boundary before `cursor` in `s`.
+/// Words are delimited by alphanumeric category changes and whitespace.
+pub fn word_boundary_before(s: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let before = &s[..cursor];
+    let mut byte_end = cursor;
+    let mut chars = before.chars().rev();
+    // skip trailing whitespace
+    while let Some(c) = chars.next() {
+        if !c.is_whitespace() {
+            byte_end -= c.len_utf8();
+            break;
+        }
+        byte_end -= c.len_utf8();
+    }
+    if byte_end == 0 {
+        return 0;
+    }
+    // determine category of first non-whitespace char
+    let first = before[byte_end..].chars().next().unwrap();
+    let is_alnum = first.is_alphanumeric();
+    // consume same-category chars
+    let mut pos = byte_end;
+    for c in before[..byte_end].chars().rev() {
+        if c.is_whitespace() || c.is_alphanumeric() != is_alnum {
+            break;
+        }
+        pos -= c.len_utf8();
+    }
+    pos
+}
+
+/// Find the byte offset of the word boundary after `cursor` in `s`.
+#[allow(dead_code)]
+pub fn word_boundary_after(s: &str, cursor: usize) -> usize {
+    if cursor >= s.len() {
+        return cursor;
+    }
+    let after = &s[cursor..];
+    let mut i = 0;
+    // skip leading whitespace
+    for c in after.chars() {
+        if !c.is_whitespace() {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    if i >= after.len() {
+        return s.len();
+    }
+    let first = after[i..].chars().next().unwrap();
+    let is_alnum = first.is_alphanumeric();
+    for c in after[i..].chars() {
+        if c.is_whitespace() || c.is_alphanumeric() != is_alnum {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    cursor + i
+}
+
+/// Free-function version of strip_line that doesn't borrow self.
+/// Takes optional prefix/suffix regex patterns to use for stripping.
+fn strip_line_impl(
+    raw: &str,
+    prefix_re: &Option<crate::http_client::RegexPattern>,
+    suffix_re: &Option<crate::http_client::RegexPattern>,
+) -> Result<String, String> {
+    let stripped = match prefix_re.as_ref().and_then(|r| r.compiled()) {
+        Some(re) => re.replace(raw, "").into_owned(),
+        None => {
+            let re = prefix_re
+                .as_ref()
+                .ok_or("No prefix regex available")?
+                .compile()
+                .map_err(|_| {
+                    format!(
+                        "Invalid prefix regex: {}",
+                        prefix_re.as_ref().map(|r| r.pattern()).unwrap_or("")
+                    )
+                })?;
+            re.replace(raw, "").into_owned()
+        }
+    };
+    let stripped = match suffix_re.as_ref().and_then(|r| r.compiled()) {
+        Some(re) => re.replace(&stripped, "").into_owned(),
+        None => {
+            let re = suffix_re
+                .as_ref()
+                .ok_or("No suffix regex available")?
+                .compile()
+                .map_err(|_| {
+                    format!(
+                        "Invalid suffix regex: {}",
+                        suffix_re.as_ref().map(|r| r.pattern()).unwrap_or("")
+                    )
+                })?;
+            re.replace(&stripped, "").into_owned()
+        }
+    };
+    Ok(stripped)
+}
+
+// ── Event / state enums ───────────────────────────────────────────────────────
 
 /// Events produced by the jq reader threads (stdout → Output, stderr → Error).
 #[derive(Debug)]
@@ -57,21 +172,67 @@ pub enum FocusableField {
     Response,
 }
 
+/// Which header sub-field the user is currently editing (key or value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderField {
+    Key,
+    Value,
+}
+
+/// State of the header autocomplete dropdown.
+#[derive(Debug, Clone)]
+pub struct AutocompleteState {
+    pub selected: usize,
+}
+
+/// A running jq subprocess with its stdin handle.
+pub struct JqProcess {
+    pub stdin: std::process::ChildStdin,
+    pub child: std::process::Child,
+}
+
+impl Drop for JqProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Per-request response and streaming state.
+#[derive(Debug, Clone)]
+pub struct PerRequestState {
+    pub events: Vec<String>,
+    pub streamed_body: String,
+    pub last_response: Option<Result<HttpResponse, HttpError>>,
+    pub jq_output: Vec<String>,
+    pub line_buffer: String,
+    pub stripped_lines: Vec<String>,
+    pub last_fed: String,
+}
+
+impl PerRequestState {
+    fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            streamed_body: String::new(),
+            last_response: None,
+            jq_output: Vec::new(),
+            line_buffer: String::new(),
+            stripped_lines: Vec::new(),
+            last_fed: String::new(),
+        }
+    }
+}
+
 pub struct App {
     pub current_screen: CurrentScreen,
     pub requests: Vec<HttpRequest>,
     pub current_request_index: Option<usize>,
     pub pending_response:
-        Option<oneshot::Receiver<Result<HttpResponse, crate::http_client::HttpError>>>,
-    /// The request index that is currently in-flight (set when the request is sent).
+        Option<oneshot::Receiver<Result<HttpResponse, HttpError>>>,
     pub pending_request_index: Option<usize>,
     pub event_receiver: Option<mpsc::UnboundedReceiver<RequestEvent>>,
-    /// Per-request event log (keyed by request index).
-    pub request_events_per: HashMap<usize, Vec<String>>,
-    /// Per-request streamed body accumulator (keyed by request index).
-    pub streamed_body_per: HashMap<usize, String>,
-    /// Per-request last response (keyed by request index).
-    pub last_response_per: HashMap<usize, Result<HttpResponse, String>>,
+    pub per_request: HashMap<usize, PerRequestState>,
     pub http_runtime: HttpRuntime,
     pub editing_field: Option<EditingField>,
     pub focused_field: FocusableField,
@@ -81,49 +242,23 @@ pub struct App {
     pub header_key_cursor: usize,
     pub header_value_buffer: String,
     pub header_value_cursor: usize,
-    pub editing_header_key: bool,
-    pub editing_existing_header: Option<String>, // Original header key when editing
+    pub header_field: HeaderField,
+    pub editing_existing_header: Option<String>,
     pub selected_header_index: usize,
-    // Autocomplete state for headers
-    pub header_autocomplete_visible: bool,
-    pub header_autocomplete_selected: usize,
-    // Response view mode
+    pub header_autocomplete: Option<AutocompleteState>,
     pub response_view_mode: ResponseViewMode,
-    // Scroll positions for each field
     pub headers_scroll: u16,
     pub body_scroll: u16,
     pub events_scroll: u16,
     pub response_scroll: u16,
-    // Horizontal scroll for single-line editing fields
     pub url_h_scroll: u16,
     pub filter_h_scroll: u16,
-    // Last save status message (shown briefly in the footer)
     pub last_save_status: Option<String>,
-    // Keybinding map (single source of truth for dispatch + hints)
     pub keymap: Keymap,
-
-    // ── Streamed-jq mode ──────────────────────────────────────────────────────
-    /// Whether at least one stripped line successfully parsed as JSON —
-    /// gates availability of StreamedJson mode in the view-mode cycle.
     pub streamed_jq_available: bool,
-    /// Per-request accumulator of jq-filtered lines (as raw ANSI strings).
-    pub streamed_jq_output_per: HashMap<usize, Vec<String>>,
-    /// Per-request line reassembly buffer (holds incomplete last line of a chunk).
-    pub streamed_line_buffer_per: HashMap<usize, String>,
-    /// Per-request accumulator of stripped (prefix/suffix removed) lines,
-    /// used to re-feed jq when the filter or regexes change.
-    pub streamed_stripped_lines_per: HashMap<usize, Vec<String>>,
-    /// Sender for jq events coming from the reader threads.
     pub streamed_jq_output_tx: Option<mpsc::UnboundedSender<JqEvent>>,
-    /// Receiver for jq events from the reader threads.
     pub streamed_jq_output_rx: Option<mpsc::UnboundedReceiver<JqEvent>>,
-    /// Per-request: the last stripped line fed to jq, used to prepend the
-    /// original value when jq reports a parse error for it.
-    pub streamed_jq_last_fed_per: HashMap<usize, String>,
-    /// Handle for the jq subprocess stdin (kept alive so the process stays running).
-    pub streamed_jq_stdin: Option<std::process::ChildStdin>,
-    /// Handle to the jq child process (for killing/waiting on cleanup).
-    pub streamed_jq_child: Option<std::process::Child>,
+    pub streamed_jq_process: Option<JqProcess>,
 }
 
 impl App {
@@ -137,8 +272,7 @@ impl App {
             pending_response: None,
             pending_request_index: None,
             event_receiver: None,
-            request_events_per: HashMap::new(),
-            last_response_per: HashMap::new(),
+            per_request: HashMap::new(),
             http_runtime: HttpRuntime::new().expect("Failed to create HTTP runtime"),
             editing_field: None,
             focused_field: FocusableField::Url,
@@ -148,11 +282,10 @@ impl App {
             header_key_cursor: 0,
             header_value_buffer: String::new(),
             header_value_cursor: 0,
-            editing_header_key: true,
+            header_field: HeaderField::Key,
             editing_existing_header: None,
             selected_header_index: 0,
-            header_autocomplete_visible: false,
-            header_autocomplete_selected: 0,
+            header_autocomplete: None,
             response_view_mode: ResponseViewMode::Text,
             headers_scroll: 0,
             body_scroll: 0,
@@ -160,18 +293,12 @@ impl App {
             response_scroll: 0,
             url_h_scroll: 0,
             filter_h_scroll: 0,
-            streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
             streamed_jq_available: false,
-            streamed_jq_output_per: HashMap::new(),
-            streamed_line_buffer_per: HashMap::new(),
-            streamed_stripped_lines_per: HashMap::new(),
             streamed_jq_output_tx: None,
             streamed_jq_output_rx: None,
-            streamed_jq_last_fed_per: HashMap::new(),
-            streamed_jq_stdin: None,
-            streamed_jq_child: None,
+            streamed_jq_process: None,
         }
     }
 
@@ -189,24 +316,24 @@ impl App {
 
     pub fn current_jq_filter(&self) -> &str {
         self.get_current_request()
-            .map(|r| r.jq_filter.as_str())
+            .map(|r| r.jq_filter.as_ref())
             .unwrap_or(".")
     }
 
     pub fn current_stream_prefix_regex(&self) -> &str {
         self.get_current_request()
-            .map(|r| r.stream_prefix_regex.as_str())
+            .map(|r| r.stream_prefix_regex.pattern())
             .unwrap_or(r"^\w+:\s*")
     }
 
     pub fn current_stream_suffix_regex(&self) -> &str {
         self.get_current_request()
-            .map(|r| r.stream_suffix_regex.as_str())
+            .map(|r| r.stream_suffix_regex.pattern())
             .unwrap_or(r"\s*$")
     }
 
     pub fn create_new_request(&mut self) {
-        let new_request = HttpRequest::new(Method::GET, "https://".to_string());
+        let new_request = HttpRequest::new(Method::GET, "https://");
         self.requests.push(new_request);
         self.current_request_index = Some(self.requests.len() - 1);
     }
@@ -215,10 +342,10 @@ impl App {
         if let Some(idx) = self.current_request_index {
             if idx < self.requests.len() {
                 self.requests.remove(idx);
-                // Clean up per-request response state for the deleted index.
-                // Indices above the deleted one shift down by one, so rebuild the maps.
-                self.last_response_per = self
-                    .last_response_per
+                self.per_request.remove(&idx);
+                // Shift keys for entries above the deleted index.
+                self.per_request = self
+                    .per_request
                     .drain()
                     .filter_map(|(k, v)| {
                         if k == idx {
@@ -230,36 +357,8 @@ impl App {
                         }
                     })
                     .collect();
-                self.streamed_body_per = self
-                    .streamed_body_per
-                    .drain()
-                    .filter_map(|(k, v)| {
-                        if k == idx {
-                            None
-                        } else if k > idx {
-                            Some((k - 1, v))
-                        } else {
-                            Some((k, v))
-                        }
-                    })
-                    .collect();
-                self.request_events_per = self
-                    .request_events_per
-                    .drain()
-                    .filter_map(|(k, v)| {
-                        if k == idx {
-                            None
-                        } else if k > idx {
-                            Some((k - 1, v))
-                        } else {
-                            Some((k, v))
-                        }
-                    })
-                    .collect();
-                // Also shift the pending index if needed.
                 if let Some(pending) = self.pending_request_index {
                     if pending == idx {
-                        // The in-flight request was deleted; abandon its results.
                         self.pending_response = None;
                         self.pending_request_index = None;
                         self.event_receiver = None;
@@ -301,21 +400,13 @@ impl App {
     pub fn send_current_request(&mut self) {
         if let Some(idx) = self.current_request_index {
             if let Some(request) = self.requests.get(idx).cloned() {
-                // Kill any existing streamed-jq process
                 self.kill_streamed_jq();
 
                 let (result_rx, event_rx) = self.http_runtime.execute_request(request);
                 self.pending_response = Some(result_rx);
                 self.pending_request_index = Some(idx);
                 self.event_receiver = Some(event_rx);
-                self.request_events_per.insert(idx, Vec::new());
-                self.streamed_body_per.insert(idx, String::new());
-                self.last_response_per.remove(&idx);
-                // Reset per-request streamed-jq accumulators
-                self.streamed_jq_output_per.insert(idx, Vec::new());
-                self.streamed_line_buffer_per.insert(idx, String::new());
-                self.streamed_stripped_lines_per.insert(idx, Vec::new());
-                self.streamed_jq_last_fed_per.remove(&idx);
+                self.per_request.insert(idx, PerRequestState::new());
                 self.streamed_jq_available = false;
             }
         }
@@ -326,35 +417,33 @@ impl App {
             match receiver.try_recv() {
                 Ok(result) => {
                     if let Some(idx) = self.pending_request_index {
+                        let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
                         match result {
                             Ok(resp) => {
-                                self.streamed_body_per.insert(idx, resp.body.clone());
-                                self.last_response_per.insert(idx, Ok(resp));
+                                state.streamed_body = resp.body.clone();
+                                state.last_response = Some(Ok(resp));
                             }
                             Err(e) => {
-                                self.last_response_per.insert(idx, Err(e.to_string()));
+                                state.last_response = Some(Err(e));
                             }
                         }
                     }
                     self.pending_response = None;
-                    // NOTE: We intentionally do NOT clear pending_request_index,
-                    // flush the line buffer, or close jq stdin here.  Body-chunk
-                    // events may still be buffered in event_receiver — they are
-                    // processed in check_for_events using pending_request_index.
-                    // Cleanup happens in check_for_events once the event channel
-                    // is fully drained (sender dropped / disconnected).
                 }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    // Still waiting
-                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     if let Some(idx) = self.pending_request_index {
-                        self.last_response_per
-                            .insert(idx, Err("Request channel closed".to_string()));
+                        self.per_request
+                            .entry(idx)
+                            .or_insert_with(PerRequestState::new)
+                            .last_response = Some(Err(HttpError::RequestFailed {
+                            msg: "Request channel closed".to_string(),
+                            source: None,
+                        }));
                     }
                     self.pending_response = None;
                     self.pending_request_index = None;
-                    self.streamed_jq_stdin = None;
+                    self.streamed_jq_process = None;
                 }
             }
         }
@@ -363,27 +452,21 @@ impl App {
     pub fn check_for_events(&mut self) -> bool {
         let mut received_any = false;
 
-        // Drain jq output events from the reader threads.
-        // Also detect if the jq channel is disconnected (jq exited,
-        // all reader threads dropped their tx clones).
         let mut jq_channel_closed = false;
         if let Some(rx) = &mut self.streamed_jq_output_rx {
             loop {
                 match rx.try_recv() {
                     Ok(event) => {
                         if let Some(idx) = self.current_request_index {
-                            let output_lines = self.streamed_jq_output_per.entry(idx).or_default();
+                            let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
                             match event {
                                 JqEvent::Output(line) => {
-                                    output_lines.push(line);
+                                    state.jq_output.push(line);
                                 }
                                 JqEvent::Error(err) => {
-                                    let original = self
-                                        .streamed_jq_last_fed_per
-                                        .get(&idx)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    output_lines
+                                    let original = state.last_fed.clone();
+                                    state
+                                        .jq_output
                                         .push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
                                 }
                             }
@@ -399,17 +482,13 @@ impl App {
             }
         }
         if jq_channel_closed {
-            // jq has exited and all output has been consumed; clean up.
             self.streamed_jq_output_rx = None;
             self.streamed_jq_output_tx = None;
-            if let Some(mut child) = self.streamed_jq_child.take() {
-                let _ = child.wait();
+            if let Some(mut jq) = self.streamed_jq_process.take() {
+                let _ = jq.child.wait();
             }
         }
 
-        // Collect all events first (releases the borrow on event_receiver), then process.
-        // Also detect whether the event channel is disconnected (sender dropped,
-        // all messages already received) — this means no more body chunks will arrive.
         let mut collected_events: Vec<RequestEvent> = Vec::new();
         let mut event_channel_closed = false;
         if let Some(receiver) = &mut self.event_receiver {
@@ -431,34 +510,27 @@ impl App {
         let idx_opt = self.pending_request_index;
         for event in collected_events {
             if let Some(idx) = idx_opt {
+                let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
                 match event {
                     crate::http_client::RequestEvent::BodyChunk(s) => {
-                        self.streamed_body_per.entry(idx).or_default().push_str(&s);
-                        self.request_events_per
-                            .entry(idx)
-                            .or_default()
+                        state.streamed_body.push_str(&s);
+                        state
+                            .events
                             .push(format!("Response chunk received: {} bytes", s.len()));
-                        // Feed the chunk into the line reassembly buffer
                         self.process_chunk(idx, s);
                     }
                     other => {
-                        self.request_events_per
-                            .entry(idx)
-                            .or_default()
-                            .push(other.to_string());
+                        state.events.push(other.to_string());
                     }
                 }
             }
         }
 
-        // Once the HTTP response oneshot has resolved (pending_response is None)
-        // AND the event channel is fully drained+closed, perform final cleanup:
-        // flush the line buffer and close jq stdin so it can process the last input.
         if event_channel_closed && self.pending_response.is_none() {
             if let Some(idx) = self.pending_request_index.take() {
                 self.flush_line_buffer(idx);
             }
-            self.streamed_jq_stdin = None;
+            self.streamed_jq_process = None;
             self.event_receiver = None;
         }
 
@@ -467,7 +539,6 @@ impl App {
 
     pub fn toggle_method(&mut self) {
         if let Some(request) = self.get_current_request_mut() {
-            // Cycle through standard HTTP methods
             request.method = match request.method {
                 Method::GET => Method::POST,
                 Method::POST => Method::PUT,
@@ -476,40 +547,35 @@ impl App {
                 Method::DELETE => Method::HEAD,
                 Method::HEAD => Method::OPTIONS,
                 Method::OPTIONS => Method::GET,
-                // For any other methods (custom), cycle back to GET
                 _ => Method::GET,
             };
         }
     }
 
-    /// Returns whether a request is currently in-flight for the *current* request.
     pub fn current_request_is_pending(&self) -> bool {
         self.pending_request_index == self.current_request_index && self.pending_response.is_some()
     }
 
-    /// Returns the last response for the currently selected request, if any.
-    pub fn current_last_response(&self) -> Option<&Result<HttpResponse, String>> {
+    pub fn current_last_response(&self) -> Option<&Result<HttpResponse, HttpError>> {
         self.current_request_index
-            .and_then(|idx| self.last_response_per.get(&idx))
+            .and_then(|idx| self.per_request.get(&idx))
+            .and_then(|s| s.last_response.as_ref())
     }
 
-    /// Returns the streamed body accumulator for the currently selected request.
     pub fn current_streamed_body(&self) -> &str {
         self.current_request_index
-            .and_then(|idx| self.streamed_body_per.get(&idx))
-            .map(String::as_str)
+            .and_then(|idx| self.per_request.get(&idx))
+            .map(|s| s.streamed_body.as_str())
             .unwrap_or("")
     }
 
-    /// Returns the request events log for the currently selected request.
     pub fn current_request_events(&self) -> &[String] {
         self.current_request_index
-            .and_then(|idx| self.request_events_per.get(&idx))
-            .map(Vec::as_slice)
+            .and_then(|idx| self.per_request.get(&idx))
+            .map(|s| s.events.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Returns true when the last response body is valid JSON (parsed by serde_json).
     pub fn is_response_json(&self) -> bool {
         if let Some(Ok(resp)) = self.current_last_response() {
             serde_json::from_str::<serde_json::Value>(&resp.body).is_ok()
@@ -520,32 +586,10 @@ impl App {
 
     // ── Streamed-jq helpers ───────────────────────────────────────────────────
 
-    /// Strip prefix and suffix regex from a raw line.  Returns the stripped
-    /// string, or an error message if a regex fails to compile.
-    fn strip_line(&self, raw: &str) -> Result<String, String> {
-        let stripped = if let Ok(re) = Regex::new(self.current_stream_prefix_regex()) {
-            re.replace(raw, "").into_owned()
-        } else {
-            return Err(format!(
-                "Invalid prefix regex: {}",
-                self.current_stream_prefix_regex()
-            ));
-        };
-        let stripped = if let Ok(re) = Regex::new(self.current_stream_suffix_regex()) {
-            re.replace(&stripped, "").into_owned()
-        } else {
-            return Err(format!(
-                "Invalid suffix regex: {}",
-                self.current_stream_suffix_regex()
-            ));
-        };
-        Ok(stripped)
-    }
-
     /// Ensure the persistent jq subprocess is running (starting it if needed).
     /// Returns `true` if jq is ready to receive input.
     fn ensure_jq_running(&mut self) -> bool {
-        if self.streamed_jq_stdin.is_some() {
+        if self.streamed_jq_process.is_some() {
             return true;
         }
         let filter = {
@@ -602,17 +646,16 @@ impl App {
 
                 self.streamed_jq_output_tx = Some(tx);
                 self.streamed_jq_output_rx = Some(rx);
-                self.streamed_jq_stdin = Some(stdin);
-                self.streamed_jq_child = Some(child);
+                self.streamed_jq_process = Some(JqProcess { stdin, child });
                 true
             }
             Err(e) => {
-                // Record the error as a fake output line
                 let msg = format!("\x1b[31m// Failed to start jq: {e}\x1b[0m");
                 if let Some(idx) = self.current_request_index {
-                    self.streamed_jq_output_per
+                    self.per_request
                         .entry(idx)
-                        .or_default()
+                        .or_insert_with(PerRequestState::new)
+                        .jq_output
                         .push(msg);
                 }
                 false
@@ -622,13 +665,9 @@ impl App {
 
     /// Kill and clean up the jq subprocess if running.
     pub fn kill_streamed_jq(&mut self) {
-        self.streamed_jq_stdin = None; // drops stdin → jq gets EOF
+        self.streamed_jq_process = None;
         self.streamed_jq_output_tx = None;
         self.streamed_jq_output_rx = None;
-        if let Some(mut child) = self.streamed_jq_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 
     /// Send a single stripped line to the jq subprocess stdin.
@@ -638,41 +677,36 @@ impl App {
         if !self.ensure_jq_running() {
             return;
         }
-        let write_ok = if let Some(stdin) = &mut self.streamed_jq_stdin {
-            writeln!(stdin, "{stripped}").is_ok()
+        let write_ok = if let Some(jq) = &mut self.streamed_jq_process {
+            writeln!(jq.stdin, "{stripped}").is_ok()
         } else {
             false
         };
         if !write_ok {
-            // jq died (parse error on previous line). Drain any output that
-            // already arrived in the channel before dropping it, then restart.
             if let Some(rx) = &mut self.streamed_jq_output_rx {
                 while let Ok(event) = rx.try_recv() {
-                    let out = self.streamed_jq_output_per.entry(idx).or_default();
+                    let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
                     match event {
-                        JqEvent::Output(line) => out.push(line),
+                        JqEvent::Output(line) => state.jq_output.push(line),
                         JqEvent::Error(err) => {
-                            let original = self
-                                .streamed_jq_last_fed_per
-                                .get(&idx)
-                                .cloned()
-                                .unwrap_or_default();
-                            out.push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
+                            let original = state.last_fed.clone();
+                            state.jq_output.push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
                         }
                     }
                 }
             }
             self.kill_streamed_jq();
             if self.ensure_jq_running() {
-                if let Some(stdin) = &mut self.streamed_jq_stdin {
-                    let _ = writeln!(stdin, "{stripped}");
+                if let Some(jq) = &mut self.streamed_jq_process {
+                    let _ = writeln!(jq.stdin, "{stripped}");
                 }
             }
         }
-        // Remember this as the last fed line so we can show it alongside
-        // any jq parse error that arrives for it.
-        self.streamed_jq_last_fed_per
-            .insert(idx, stripped.to_string());
+        self
+            .per_request
+            .entry(idx)
+            .or_insert_with(PerRequestState::new)
+            .last_fed = stripped.to_string();
     }
 
     /// Run `jq` synchronously on a batch of pre-stripped JSON lines, returning
@@ -734,108 +768,103 @@ impl App {
         output
     }
 
-    /// Process a raw chunk: append to line buffer, extract complete lines,
-    /// apply prefix/suffix stripping, update availability flag, and feed jq.
     fn process_chunk(&mut self, idx: usize, chunk: String) {
-        let buf = self.streamed_line_buffer_per.entry(idx).or_default();
-        buf.push_str(&chunk);
+        let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+        state.line_buffer.push_str(&chunk);
 
-        // Split on newlines; the last element (possibly empty) is the
-        // incomplete tail that stays in the buffer.
-        let combined = std::mem::take(buf);
+        let combined = std::mem::take(&mut state.line_buffer);
         let mut parts: Vec<&str> = combined.split('\n').collect();
         let tail = parts.pop().unwrap_or("").to_string();
-        *self.streamed_line_buffer_per.entry(idx).or_default() = tail;
+        state.line_buffer = tail;
 
         for raw_line in parts {
             self.handle_complete_line(idx, raw_line);
         }
     }
 
-    /// Process one complete (newline-terminated) raw line.
     fn handle_complete_line(&mut self, idx: usize, raw: &str) {
-        let trimmed = raw.trim_end_matches('\r'); // handle CRLF
-        match self.strip_line(trimmed) {
+        let trimmed = raw.trim_end_matches('\r');
+        // Extract regex before mutable borrow of per_request
+        let prefix_re = self
+            .get_current_request()
+            .map(|r| r.stream_prefix_regex.clone());
+        let suffix_re = self
+            .get_current_request()
+            .map(|r| r.stream_suffix_regex.clone());
+
+        let strip_result = strip_line_impl(trimmed, &prefix_re, &suffix_re);
+        match strip_result {
             Err(e) => {
                 let msg = format!("\x1b[31m// {e}\x1b[0m");
-                self.streamed_jq_output_per
+                self.per_request
                     .entry(idx)
-                    .or_default()
+                    .or_insert_with(PerRequestState::new)
+                    .jq_output
                     .push(msg);
             }
             Ok(stripped) => {
                 if stripped.is_empty() {
                     return;
                 }
-                // Check if this line is valid JSON → unlock streamed-jq mode
                 if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
                     self.streamed_jq_available = true;
                 }
-                // Save stripped line for re-processing on filter change
-                self.streamed_stripped_lines_per
+                self.per_request
                     .entry(idx)
-                    .or_default()
+                    .or_insert_with(PerRequestState::new)
+                    .stripped_lines
                     .push(stripped.clone());
-                // Feed to jq
                 self.feed_line_to_jq(idx, &stripped);
             }
         }
     }
 
-    /// Flush any remaining bytes in the line buffer as a final (incomplete) line.
     fn flush_line_buffer(&mut self, idx: usize) {
         let tail = self
-            .streamed_line_buffer_per
+            .per_request
             .get(&idx)
-            .cloned()
+            .map(|s| s.line_buffer.clone())
             .unwrap_or_default();
         if !tail.is_empty() {
             self.handle_complete_line(idx, &tail);
-            self.streamed_line_buffer_per.insert(idx, String::new());
+            self.per_request
+                .entry(idx)
+                .or_insert_with(PerRequestState::new)
+                .line_buffer
+                .clear();
         }
     }
 
-    /// Re-process all accumulated stripped lines through a fresh jq subprocess
-    /// (called after the user changes the jq filter or prefix/suffix regexes).
-    ///
-    /// Unlike the live-streaming path this runs jq **synchronously** — one
-    /// jq invocation per stripped line, waiting for each to finish before
-    /// moving on.  This guarantees that no output is lost to timing races
-    /// (jq exiting before we drain its channel, etc.).
     pub fn reprocess_streamed_jq(&mut self) {
         let Some(idx) = self.current_request_index else {
             return;
         };
-        // Kill any running live-streaming jq process.
+        // Extract regex patterns before the mutable borrow below.
+        let prefix_re = self
+            .get_current_request()
+            .map(|r| r.stream_prefix_regex.clone());
+        let suffix_re = self
+            .get_current_request()
+            .map(|r| r.stream_suffix_regex.clone());
+        let filter = self.current_jq_filter().to_string();
+
         self.kill_streamed_jq();
 
-        // Clear old output and last-fed tracker.
-        self.streamed_jq_output_per.insert(idx, Vec::new());
-        self.streamed_jq_last_fed_per.remove(&idx);
+        let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+        state.jq_output.clear();
+        state.last_fed.clear();
 
-        // Re-strip all raw lines from the complete body, rebuilding the
-        // stripped-lines accumulator and the availability flag.
-        let body = self
-            .streamed_body_per
-            .get(&idx)
-            .cloned()
-            .unwrap_or_default();
-        self.streamed_stripped_lines_per.insert(idx, Vec::new());
+        let body = state.streamed_body.clone();
+        state.stripped_lines.clear();
         self.streamed_jq_available = false;
 
-        // Collect stripped lines without calling handle_complete_line
-        // (which would try to feed the async jq that we just killed).
         let raw_lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
         let mut stripped_lines: Vec<String> = Vec::new();
         for raw in &raw_lines {
             let trimmed = raw.trim_end_matches('\r');
-            match self.strip_line(trimmed) {
+            match strip_line_impl(trimmed, &prefix_re, &suffix_re) {
                 Err(e) => {
-                    // Invalid regex — record error and continue.
-                    self.streamed_jq_output_per
-                        .entry(idx)
-                        .or_default()
-                        .push(format!("\x1b[31m// {e}\x1b[0m"));
+                    state.jq_output.push(format!("\x1b[31m// {e}\x1b[0m"));
                 }
                 Ok(stripped) => {
                     if stripped.is_empty() {
@@ -844,29 +873,20 @@ impl App {
                     if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
                         self.streamed_jq_available = true;
                     }
-                    self.streamed_stripped_lines_per
-                        .entry(idx)
-                        .or_default()
-                        .push(stripped.clone());
+                    state.stripped_lines.push(stripped.clone());
                     stripped_lines.push(stripped);
                 }
             }
         }
 
-        // Run jq synchronously on the collected stripped lines.
-        let filter = self.current_jq_filter().to_string();
         let batch_output = Self::run_jq_batch_sync(&filter, &stripped_lines);
-        self.streamed_jq_output_per
-            .entry(idx)
-            .or_default()
-            .extend(batch_output);
+        state.jq_output.extend(batch_output);
     }
 
-    /// Returns the joined streamed-jq output for the currently selected request.
     pub fn current_streamed_jq_output(&self) -> String {
         self.current_request_index
-            .and_then(|idx| self.streamed_jq_output_per.get(&idx))
-            .map(|lines| lines.join("\n"))
+            .and_then(|idx| self.per_request.get(&idx))
+            .map(|s| s.jq_output.join("\n"))
             .unwrap_or_default()
     }
 
@@ -895,8 +915,6 @@ impl App {
         };
     }
 
-    /// Runs the current `jq_filter` against the last response body via the
-    /// `jq` binary and returns the colourised output, or an error string.
     pub fn run_jq(&self) -> String {
         let body = match self.current_last_response() {
             Some(Ok(resp)) => &resp.body,
@@ -959,21 +977,19 @@ impl App {
         self.editing_field = Some(match self.focused_field {
             FocusableField::Url => {
                 if let Some(request) = self.get_current_request() {
-                    self.input_buffer = request.url.clone();
+                    self.input_buffer = request.url.to_string();
                 }
                 self.cursor_pos = self.input_buffer.len();
                 EditingField::Url
             }
             FocusableField::Headers => {
-                // Start adding a new header
                 self.header_key_buffer.clear();
                 self.header_key_cursor = 0;
                 self.header_value_buffer.clear();
                 self.header_value_cursor = 0;
-                self.editing_header_key = true;
+                self.header_field = HeaderField::Key;
                 self.editing_existing_header = None;
-                self.header_autocomplete_visible = true;
-                self.header_autocomplete_selected = 0;
+                self.header_autocomplete = Some(AutocompleteState { selected: 0 });
                 EditingField::Headers
             }
             FocusableField::Body => {
@@ -984,7 +1000,6 @@ impl App {
                 EditingField::Body
             }
             FocusableField::RequestEvents | FocusableField::Response => {
-                // These fields are not editable
                 return;
             }
         });
@@ -1012,26 +1027,23 @@ impl App {
     }
 
     pub fn edit_selected_header(&mut self) {
-        // Get the header data first
         let header_data = self.get_current_request().and_then(|request| {
             request
                 .headers
                 .iter()
                 .nth(self.selected_header_index)
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
         });
 
-        // Now set the buffers
         if let Some((key, value)) = header_data {
-            self.editing_existing_header = Some(key.clone()); // Track original key
+            self.editing_existing_header = Some(key.clone());
             self.header_key_buffer = key;
             self.header_key_cursor = self.header_key_buffer.len();
             self.header_value_buffer = value;
             self.header_value_cursor = self.header_value_buffer.len();
             self.editing_field = Some(EditingField::Headers);
-            self.editing_header_key = true; // Start editing header name
-            self.header_autocomplete_visible = true;
-            self.header_autocomplete_selected = 0;
+            self.header_field = HeaderField::Key;
+            self.header_autocomplete = Some(AutocompleteState { selected: 0 });
         }
     }
 
@@ -1039,10 +1051,9 @@ impl App {
         let selected_idx = self.selected_header_index;
 
         if let Some(request) = self.get_current_request_mut() {
-            let keys: Vec<_> = request.headers.keys().cloned().collect();
+            let keys: Vec<_> = request.headers.keys().map(|k| k.to_string()).collect();
             if let Some(key) = keys.get(selected_idx) {
                 request.remove_header(key);
-                // Adjust selected index if needed
                 let new_len = request.headers.len();
                 if selected_idx >= new_len && selected_idx > 0 {
                     self.selected_header_index = selected_idx - 1;
@@ -1051,8 +1062,6 @@ impl App {
         }
     }
 
-    /// Returns a mutable reference to the scroll counter for the currently focused field,
-    /// or `None` if the focused field is not scrollable (e.g. `Url`).
     fn focused_scroll(&mut self) -> Option<&mut u16> {
         match self.focused_field {
             FocusableField::Headers => Some(&mut self.headers_scroll),
@@ -1075,7 +1084,6 @@ impl App {
         }
     }
 
-    /// Returns the current key context for keymap resolution and hint display.
     pub fn key_context(&self) -> KeyContext {
         KeyContext {
             screen: self.current_screen,
@@ -1085,7 +1093,6 @@ impl App {
     }
 
     pub fn reset_request_screen_state(&mut self) {
-        // Reset editing state
         self.editing_field = None;
         self.input_buffer.clear();
         self.cursor_pos = 0;
@@ -1093,27 +1100,20 @@ impl App {
         self.header_key_cursor = 0;
         self.header_value_buffer.clear();
         self.header_value_cursor = 0;
-        self.editing_header_key = true;
+        self.header_field = HeaderField::Key;
         self.editing_existing_header = None;
-
-        // Reset focus
         self.focused_field = FocusableField::Url;
-
-        // Reset scroll positions
         self.headers_scroll = 0;
         self.body_scroll = 0;
         self.events_scroll = 0;
         self.response_scroll = 0;
         self.url_h_scroll = 0;
         self.filter_h_scroll = 0;
-
-        // Reset autocomplete
-        self.header_autocomplete_visible = false;
-        self.header_autocomplete_selected = 0;
+        self.header_autocomplete = None;
     }
 
     pub fn get_filtered_header_suggestions(&self) -> Vec<&'static str> {
-        if !self.editing_header_key {
+        if self.header_field != HeaderField::Key {
             return Vec::new();
         }
 
@@ -1129,7 +1129,6 @@ impl App {
                 .collect()
         };
 
-        // Sort by relevance (starts with query first, then by length)
         suggestions.sort_by(|a, b| {
             let a_lower = a.to_lowercase();
             let b_lower = b.to_lowercase();
@@ -1147,23 +1146,32 @@ impl App {
     }
 
     pub fn select_next_autocomplete(&mut self, max: usize) {
-        if max > 0 && self.header_autocomplete_selected < max - 1 {
-            self.header_autocomplete_selected += 1;
+        if let Some(ref mut ac) = self.header_autocomplete {
+            if max > 0 && ac.selected < max - 1 {
+                ac.selected += 1;
+            }
         }
     }
 
     pub fn select_previous_autocomplete(&mut self) {
-        if self.header_autocomplete_selected > 0 {
-            self.header_autocomplete_selected -= 1;
+        if let Some(ref mut ac) = self.header_autocomplete {
+            if ac.selected > 0 {
+                ac.selected -= 1;
+            }
         }
     }
 
     pub fn apply_autocomplete_selection(&mut self, suggestions: &[&str]) {
-        if let Some(selected) = suggestions.get(self.header_autocomplete_selected) {
-            self.header_key_buffer = selected.to_string();
-            self.editing_header_key = false;
-            self.header_autocomplete_visible = false;
-            self.header_autocomplete_selected = 0;
+        let selected = self
+            .header_autocomplete
+            .as_ref()
+            .map(|ac| ac.selected);
+        if let Some(sel) = selected {
+            if let Some(selected_name) = suggestions.get(sel) {
+                self.header_key_buffer = selected_name.to_string();
+                self.header_field = HeaderField::Value;
+                self.header_autocomplete = None;
+            }
         }
     }
 
@@ -1327,7 +1335,6 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Build an App with a pre-populated request list, bypassing disk I/O.
     fn app_with_requests(requests: Vec<HttpRequest>) -> App {
         let current_request_index = if requests.is_empty() { None } else { Some(0) };
         App {
@@ -1337,8 +1344,7 @@ mod tests {
             pending_response: None,
             pending_request_index: None,
             event_receiver: None,
-            request_events_per: HashMap::new(),
-            last_response_per: HashMap::new(),
+            per_request: HashMap::new(),
             http_runtime: HttpRuntime::new().expect("runtime"),
             editing_field: None,
             focused_field: FocusableField::Url,
@@ -1348,11 +1354,10 @@ mod tests {
             header_key_cursor: 0,
             header_value_buffer: String::new(),
             header_value_cursor: 0,
-            editing_header_key: true,
+            header_field: HeaderField::Key,
             editing_existing_header: None,
             selected_header_index: 0,
-            header_autocomplete_visible: false,
-            header_autocomplete_selected: 0,
+            header_autocomplete: None,
             response_view_mode: ResponseViewMode::Text,
             headers_scroll: 0,
             body_scroll: 0,
@@ -1360,29 +1365,22 @@ mod tests {
             response_scroll: 0,
             url_h_scroll: 0,
             filter_h_scroll: 0,
-            streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
             streamed_jq_available: false,
-            streamed_jq_output_per: HashMap::new(),
-            streamed_line_buffer_per: HashMap::new(),
-            streamed_stripped_lines_per: HashMap::new(),
             streamed_jq_output_tx: None,
             streamed_jq_output_rx: None,
-            streamed_jq_last_fed_per: HashMap::new(),
-            streamed_jq_stdin: None,
-            streamed_jq_child: None,
+            streamed_jq_process: None,
         }
     }
 
     fn make_get(url: &str) -> HttpRequest {
-        HttpRequest::new(HttpMethod::GET, url.to_string())
+        HttpRequest::new(HttpMethod::GET, url)
     }
 
     fn make_response(status: u16, body: &str) -> HttpResponse {
         HttpResponse {
-            status,
-            status_text: "OK".to_string(),
+            status_code: hyper::StatusCode::from_u16(status).unwrap(),
             headers: HashMap::new(),
             body: body.to_string(),
         }
@@ -1409,7 +1407,7 @@ mod tests {
         assert_eq!(app.requests.len(), 1);
         assert_eq!(app.current_request_index, Some(0));
         assert_eq!(app.requests[0].method, HttpMethod::GET);
-        assert_eq!(app.requests[0].url, "https://");
+        assert_eq!(&*app.requests[0].url, "https://");
     }
 
     #[test]
@@ -1438,7 +1436,7 @@ mod tests {
         app.delete_current_request();
         assert_eq!(app.requests.len(), 1);
         assert_eq!(app.current_request_index, Some(0));
-        assert_eq!(app.requests[0].url, "https://second.com");
+        assert_eq!(&*app.requests[0].url, "https://second.com");
     }
 
     #[test]
@@ -1523,7 +1521,7 @@ mod tests {
             make_get("https://second.com"),
         ]);
         // index 0 is selected by default in app_with_requests
-        assert_eq!(app.get_current_request().unwrap().url, "https://first.com");
+        assert_eq!(&*app.get_current_request().unwrap().url, "https://first.com");
     }
 
     // ── Method cycling ────────────────────────────────────────────────────────
@@ -1626,8 +1624,8 @@ mod tests {
         assert_eq!(app.editing_field, Some(EditingField::Headers));
         assert_eq!(app.header_key_buffer, "");
         assert_eq!(app.header_value_buffer, "");
-        assert!(app.header_autocomplete_visible);
-        assert_eq!(app.header_autocomplete_selected, 0);
+        assert!(app.header_autocomplete.is_some());
+        assert_eq!(app.header_autocomplete.as_ref().unwrap().selected, 0);
     }
 
     #[test]
@@ -1712,8 +1710,7 @@ mod tests {
         app.body_scroll = 3;
         app.events_scroll = 2;
         app.response_scroll = 7;
-        app.header_autocomplete_visible = true;
-        app.header_autocomplete_selected = 4;
+        app.header_autocomplete = Some(AutocompleteState { selected: 4 });
 
         app.reset_request_screen_state();
 
@@ -1726,8 +1723,7 @@ mod tests {
         assert_eq!(app.body_scroll, 0);
         assert_eq!(app.events_scroll, 0);
         assert_eq!(app.response_scroll, 0);
-        assert!(!app.header_autocomplete_visible);
-        assert_eq!(app.header_autocomplete_selected, 0);
+        assert!(app.header_autocomplete.is_none());
     }
 
     // ── Header CRUD ───────────────────────────────────────────────────────────
@@ -1785,7 +1781,7 @@ mod tests {
     #[test]
     fn test_get_filtered_header_suggestions_empty_query_returns_all() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = true;
+        app.header_field = HeaderField::Key;
         app.header_key_buffer = String::new();
         let suggestions = app.get_filtered_header_suggestions();
         // There are 76 standard headers — just verify we get a non-empty full list
@@ -1796,7 +1792,7 @@ mod tests {
     #[test]
     fn test_get_filtered_header_suggestions_filters_by_prefix() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = true;
+        app.header_field = HeaderField::Key;
         app.header_key_buffer = "content".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         assert!(!suggestions.is_empty());
@@ -1814,7 +1810,7 @@ mod tests {
     #[test]
     fn test_get_filtered_header_suggestions_empty_when_not_editing_key() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = false;
+        app.header_field = HeaderField::Value;
         app.header_key_buffer = "content".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         assert!(suggestions.is_empty());
@@ -1823,7 +1819,7 @@ mod tests {
     #[test]
     fn test_get_filtered_header_suggestions_sorted_prefix_first() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = true;
+        app.header_field = HeaderField::Key;
         app.header_key_buffer = "con".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         // The first suggestions should start with "con"
@@ -1838,7 +1834,7 @@ mod tests {
     #[test]
     fn test_get_filtered_header_suggestions_no_match_returns_empty() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = true;
+        app.header_field = HeaderField::Key;
         app.header_key_buffer = "zzzzzzzzzz".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         assert!(suggestions.is_empty());
@@ -1847,52 +1843,50 @@ mod tests {
     #[test]
     fn test_select_next_autocomplete_increments() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.header_autocomplete_selected = 0;
+        app.header_autocomplete = Some(AutocompleteState { selected: 0 });
         app.select_next_autocomplete(5);
-        assert_eq!(app.header_autocomplete_selected, 1);
+        assert_eq!(app.header_autocomplete.as_ref().unwrap().selected, 1);
     }
 
     #[test]
     fn test_select_next_autocomplete_does_not_exceed_max() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.header_autocomplete_selected = 4;
-        app.select_next_autocomplete(5); // max index is 4
-        assert_eq!(app.header_autocomplete_selected, 4);
+        app.header_autocomplete = Some(AutocompleteState { selected: 4 });
+        app.select_next_autocomplete(5);
+        assert_eq!(app.header_autocomplete.as_ref().unwrap().selected, 4);
     }
 
     #[test]
     fn test_select_previous_autocomplete_decrements() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.header_autocomplete_selected = 3;
+        app.header_autocomplete = Some(AutocompleteState { selected: 3 });
         app.select_previous_autocomplete();
-        assert_eq!(app.header_autocomplete_selected, 2);
+        assert_eq!(app.header_autocomplete.as_ref().unwrap().selected, 2);
     }
 
     #[test]
     fn test_select_previous_autocomplete_does_not_underflow() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.header_autocomplete_selected = 0;
+        app.header_autocomplete = Some(AutocompleteState { selected: 0 });
         app.select_previous_autocomplete();
-        assert_eq!(app.header_autocomplete_selected, 0);
+        assert_eq!(app.header_autocomplete.as_ref().unwrap().selected, 0);
     }
 
     #[test]
     fn test_apply_autocomplete_selection_sets_key_and_hides() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.header_autocomplete_selected = 1;
-        app.header_autocomplete_visible = true;
+        app.header_autocomplete = Some(AutocompleteState { selected: 1 });
         let suggestions = &["content-type", "content-length", "authorization"];
         app.apply_autocomplete_selection(suggestions);
         assert_eq!(app.header_key_buffer, "content-length");
-        assert!(!app.editing_header_key);
-        assert!(!app.header_autocomplete_visible);
-        assert_eq!(app.header_autocomplete_selected, 0);
+        assert_eq!(app.header_field, HeaderField::Value);
+        assert!(app.header_autocomplete.is_none());
     }
 
     #[test]
     fn test_apply_autocomplete_selection_out_of_bounds_is_noop() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.header_autocomplete_selected = 99;
+        app.header_autocomplete = Some(AutocompleteState { selected: 99 });
         app.header_key_buffer = "original".to_string();
         let suggestions = &["accept"];
         app.apply_autocomplete_selection(suggestions);
@@ -1905,16 +1899,14 @@ mod tests {
     #[test]
     fn test_is_response_json_true_for_json_body() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response_per
-            .insert(0, Ok(make_response(200, r#"{"key":"value"}"#)));
+        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, r#"{"key":"value"}"#)));
         assert!(app.is_response_json());
     }
 
     #[test]
     fn test_is_response_json_false_for_plain_text() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response_per
-            .insert(0, Ok(make_response(200, "plain text response")));
+        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, "plain text response")));
         assert!(!app.is_response_json());
     }
 
@@ -1927,16 +1919,14 @@ mod tests {
     #[test]
     fn test_is_response_json_false_on_error_response() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response_per
-            .insert(0, Err("request failed".to_string()));
+        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Err(HttpError::RequestFailed { msg: "request failed".to_string(), source: None }));
         assert!(!app.is_response_json());
     }
 
     #[test]
     fn test_cycle_response_view_mode_text_to_json_when_json_available() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response_per
-            .insert(0, Ok(make_response(200, r#"{"ok":true}"#)));
+        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
         app.response_view_mode = ResponseViewMode::Text;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Json);
@@ -1945,8 +1935,7 @@ mod tests {
     #[test]
     fn test_cycle_response_view_mode_stays_text_when_not_json() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response_per
-            .insert(0, Ok(make_response(200, "not json")));
+        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, "not json")));
         app.response_view_mode = ResponseViewMode::Text;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Text);
@@ -1955,8 +1944,7 @@ mod tests {
     #[test]
     fn test_cycle_response_view_mode_json_to_text() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.last_response_per
-            .insert(0, Ok(make_response(200, r#"{"ok":true}"#)));
+        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
         app.response_view_mode = ResponseViewMode::Json;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Text);
@@ -2020,7 +2008,7 @@ mod tests {
         assert!(app.current_last_response().is_some());
         assert!(app.pending_response.is_none());
         if let Some(Ok(resp)) = app.current_last_response() {
-            assert_eq!(resp.status, 200);
+            assert_eq!(resp.status_code.as_u16(), 200);
             assert_eq!(resp.body, "hello");
         } else {
             panic!("expected Ok response");
@@ -2077,7 +2065,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].method, HttpMethod::GET);
-        assert_eq!(loaded[0].url, "https://save-test.com");
+        assert_eq!(&*loaded[0].url, "https://save-test.com");
         assert_eq!(loaded[1].method, HttpMethod::POST);
         assert_eq!(loaded[1].body, Some("payload".to_string()));
     }
@@ -2124,7 +2112,7 @@ mod tests {
 
         let loaded = load_requests_from_dir(Some(base)).expect("load");
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].url, "https://second.com");
+        assert_eq!(&*loaded[0].url, "https://second.com");
     }
 
     // ── fuzzy_match (module-private, tested via get_filtered_header_suggestions)
@@ -2133,7 +2121,7 @@ mod tests {
     fn test_fuzzy_match_via_suggestions_subsequence() {
         // "ct" should match "content-type" (c…t subsequence)
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = true;
+        app.header_field = HeaderField::Key;
         app.header_key_buffer = "ct".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         assert!(
@@ -2145,7 +2133,7 @@ mod tests {
     #[test]
     fn test_fuzzy_match_via_suggestions_no_match() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.editing_header_key = true;
+        app.header_field = HeaderField::Key;
         app.header_key_buffer = "xyz_not_a_header_xyz".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         assert!(suggestions.is_empty());

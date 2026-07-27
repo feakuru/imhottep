@@ -1,19 +1,14 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use smallvec::{smallvec, SmallVec};
 
 use crate::app::{CurrentScreen, EditingField, FocusableField};
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
-/// Identifies the complete app context for keybinding lookup.
-///
-/// A `None` `editing` field means navigation mode; a `None` `focus` field is
-/// only used in editing mode (where focus is irrelevant for most bindings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyContext {
     pub screen: CurrentScreen,
-    /// `Some(field)` means editing mode; `None` means navigation mode.
     pub editing: Option<EditingField>,
-    /// The currently focused field (relevant in navigation mode).
     pub focus: FocusableField,
 }
 
@@ -22,7 +17,6 @@ pub struct KeyContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     // ── Global ────────────────────────────────────────────────────────────────
-    /// Show the exit confirmation popup (from any navigation context).
     TriggerExit,
 
     // ── Main screen ───────────────────────────────────────────────────────────
@@ -83,7 +77,6 @@ pub enum Action {
 
 // ── Trigger ───────────────────────────────────────────────────────────────────
 
-/// A key combination that can trigger an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyTrigger {
     Char(char),
@@ -109,39 +102,33 @@ impl KeyTrigger {
 
 // ── Binding ───────────────────────────────────────────────────────────────────
 
-/// A single logical keybinding: one or more triggers that all fire the same
-/// action, plus display strings for help rendering.
 pub struct Binding {
-    /// All key triggers that fire this action.
-    pub triggers: Vec<KeyTrigger>,
+    pub triggers: SmallVec<[KeyTrigger; 4]>,
     pub action: Action,
-    /// Short display string shown in the footer/title, e.g. `"↓↑/jk"`.
     pub hint: &'static str,
-    /// Verb phrase shown after the hint, e.g. `"scroll"`.
     pub description: &'static str,
 }
 
 // ── Context match helper ──────────────────────────────────────────────────────
 
-/// How specific a context rule is. Used to pick the most specific match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Specificity {
-    /// Matches any editing field in Request screen (wildcard focus).
     AnyEditing = 0,
-    /// Matches a specific editing field.
     SpecificEditing = 1,
-    /// Matches navigation mode with any focus.
     AnyNavigation = 2,
-    /// Matches navigation mode with a specific focus.
     SpecificNavigation = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditingMatch {
+    Navigation,
+    AnyField,
+    SpecificField(EditingField),
 }
 
 struct ContextRule {
     screen: CurrentScreen,
-    /// `None` = navigation mode, `Some(None)` = any editing field,
-    /// `Some(Some(f))` = specific editing field.
-    editing: Option<Option<EditingField>>,
-    /// `None` = any focused field, `Some(f)` = specific focused field.
+    editing: EditingMatch,
     focus: Option<FocusableField>,
     bindings: Vec<Binding>,
 }
@@ -151,27 +138,24 @@ impl ContextRule {
         if self.screen != ctx.screen {
             return None;
         }
-        match (self.editing, ctx.editing) {
-            // Rule requires navigation mode; context is editing → no match
-            (None, Some(_)) => return None,
-            // Rule requires editing mode; context is navigation → no match
-            (Some(_), None) => return None,
-            // Rule requires a specific editing field; context must match
-            (Some(Some(required)), Some(actual)) if required != actual => return None,
+        match (&self.editing, ctx.editing) {
+            (EditingMatch::Navigation, Some(_)) => return None,
+            (EditingMatch::AnyField | EditingMatch::SpecificField(_), None) => return None,
+            (EditingMatch::SpecificField(required), Some(actual)) if *required != actual => {
+                return None;
+            }
             _ => {}
         }
-        // Check focus filter
         if let Some(required_focus) = self.focus {
             if required_focus != ctx.focus {
                 return None;
             }
         }
-        // Compute specificity
-        let spec = match (self.editing, self.focus) {
-            (None, None) => Specificity::AnyNavigation,
-            (None, Some(_)) => Specificity::SpecificNavigation,
-            (Some(None), _) => Specificity::AnyEditing,
-            (Some(Some(_)), _) => Specificity::SpecificEditing,
+        let spec = match (&self.editing, self.focus) {
+            (EditingMatch::Navigation, None) => Specificity::AnyNavigation,
+            (EditingMatch::Navigation, Some(_)) => Specificity::SpecificNavigation,
+            (EditingMatch::AnyField, _) => Specificity::AnyEditing,
+            (EditingMatch::SpecificField(_), _) => Specificity::SpecificEditing,
         };
         Some(spec)
     }
@@ -184,37 +168,24 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    /// Resolve a key event to an action given the current context.
-    /// The most specific matching rule wins; within a rule, earlier bindings
-    /// take precedence.
     pub fn resolve(&self, ctx: &KeyContext, event: &KeyEvent) -> Option<Action> {
-        // Collect all matching rules, sorted by descending specificity
-        let mut candidates: Vec<(Specificity, &ContextRule)> = self
+        let mut candidates: Vec<(&ContextRule, Specificity)> = self
             .rules
             .iter()
-            .filter_map(|rule| rule.matches(ctx).map(|spec| (spec, rule)))
+            .filter_map(|rule| rule.matches(ctx).map(|spec| (rule, spec)))
             .collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Iterate from most specific to least specific; return first match
-        for (_, rule) in &candidates {
+        for (rule, _) in &candidates {
             for binding in &rule.bindings {
-                for trigger in &binding.triggers {
-                    // Ctrl+C is a special case — it uses CONTROL modifier but
-                    // crossterm may report it as Char('c') with CONTROL mod.
-                    if trigger.matches(event) {
-                        return Some(binding.action);
-                    }
+                if binding.triggers.iter().any(|t| t.matches(event)) {
+                    return Some(binding.action);
                 }
             }
         }
         None
     }
 
-    /// Return all bindings active in a given context (for hint rendering).
-    ///
-    /// Returns bindings from all matching rules deduplicated by action — the
-    /// most specific binding for each action wins.
     pub fn bindings_for<'a>(&'a self, ctx: &KeyContext) -> Vec<&'a Binding> {
         let mut candidates: Vec<(Specificity, &ContextRule)> = self
             .rules
@@ -237,40 +208,26 @@ impl Keymap {
         result
     }
 
-    /// Like `bindings_for` but returns only bindings from field-specific rules
-    /// (i.e. rules with `SpecificNavigation` or `SpecificEditing` specificity).
-    ///
-    /// Used by widget titles to show only the shortcuts that are unique to
-    /// that field, not the global navigation shortcuts.
     pub fn field_bindings_for<'a>(&'a self, ctx: &KeyContext) -> Vec<&'a Binding> {
-        let specific_rules: Vec<&ContextRule> = self
-            .rules
-            .iter()
-            .filter(|rule| {
-                matches!(
-                    rule.matches(ctx),
-                    Some(Specificity::SpecificNavigation | Specificity::SpecificEditing)
-                )
-            })
-            .collect();
-
         let mut seen_actions: Vec<Action> = Vec::new();
         let mut result: Vec<&Binding> = Vec::new();
 
-        for rule in &specific_rules {
-            for binding in &rule.bindings {
-                if !seen_actions.contains(&binding.action) {
-                    seen_actions.push(binding.action);
-                    result.push(binding);
+        for rule in &self.rules {
+            if matches!(
+                rule.matches(ctx),
+                Some(Specificity::SpecificNavigation | Specificity::SpecificEditing)
+            ) {
+                for binding in &rule.bindings {
+                    if !seen_actions.contains(&binding.action) {
+                        seen_actions.push(binding.action);
+                        result.push(binding);
+                    }
                 }
             }
         }
         result
     }
 
-    /// Format hint lines for the footer given the current context.
-    ///
-    /// Returns a list of hint-string segments that can be joined with `" | "`.
     pub fn format_hint_line(&self, ctx: &KeyContext) -> String {
         self.bindings_for(ctx)
             .iter()
@@ -279,17 +236,10 @@ impl Keymap {
             .join(" | ")
     }
 
-    /// Return bindings that include any trigger that is a focus-jump shortcut
-    /// (i.e. `Char('u')`, `Char('h')`, `Char('b')`, etc.) for a specific
-    /// field — used to show focus-shortcut hints in unfocused widget titles.
-    ///
-    /// Returns `(hint, description)` pairs.
     pub fn focus_shortcut_for_field(
         &self,
         field: FocusableField,
     ) -> Vec<(&'static str, &'static str)> {
-        // We look in the Request-screen navigation rules (any focus) for
-        // actions that jump to this specific field.
         let jump_action = match field {
             FocusableField::Url => Some(Action::JumpToUrl),
             FocusableField::Headers => Some(Action::FocusHeaders),
@@ -303,7 +253,7 @@ impl Keymap {
         let nav_ctx = KeyContext {
             screen: CurrentScreen::Request,
             editing: None,
-            focus: FocusableField::Url, // any nav focus, doesn't matter
+            focus: FocusableField::Url,
         };
         self.bindings_for(&nav_ctx)
             .iter()
@@ -317,62 +267,61 @@ impl Keymap {
     pub fn default() -> Self {
         let mut rules: Vec<ContextRule> = Vec::new();
 
-        // ── Main screen — navigation ──────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Main,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Char('j'), KeyTrigger::Code(KeyCode::Down)],
+                    triggers: smallvec![KeyTrigger::Char('j'), KeyTrigger::Code(KeyCode::Down)],
                     action: Action::SelectNextRequest,
                     hint: "↓/j",
                     description: "next",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('k'), KeyTrigger::Code(KeyCode::Up)],
+                    triggers: smallvec![KeyTrigger::Char('k'), KeyTrigger::Code(KeyCode::Up)],
                     action: Action::SelectPreviousRequest,
                     hint: "↑/k",
                     description: "prev",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::PageDown)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::PageDown)],
                     action: Action::SelectNextRequest,
                     hint: "PgDn",
                     description: "next",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::PageUp)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::PageUp)],
                     action: Action::SelectPreviousRequest,
                     hint: "PgUp",
                     description: "prev",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('n')],
+                    triggers: smallvec![KeyTrigger::Char('n')],
                     action: Action::NewRequest,
                     hint: "n",
                     description: "new",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('d')],
+                    triggers: smallvec![KeyTrigger::Char('d')],
                     action: Action::DeleteRequest,
                     hint: "d",
                     description: "delete",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::EditRequest,
                     hint: "e/enter",
                     description: "edit",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('s')],
+                    triggers: smallvec![KeyTrigger::Char('s')],
                     action: Action::SaveRequests,
                     hint: "s",
                     description: "save",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Char('q'),
                         KeyTrigger::Code(KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('c')),
@@ -387,11 +336,11 @@ impl Keymap {
         // ── Exit confirmation ─────────────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Exiting,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Char('y'),
                         KeyTrigger::Code(KeyCode::Enter),
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('c')),
@@ -401,7 +350,7 @@ impl Keymap {
                     description: "yes",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Char('n'),
                         KeyTrigger::Char('q'),
                         KeyTrigger::Code(KeyCode::Esc),
@@ -415,20 +364,19 @@ impl Keymap {
         });
 
         // ── Request screen — navigation, any focus ────────────────────────────
-        // These bindings are active in navigation mode regardless of focused field.
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Tab)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Tab)],
                     action: Action::FocusNextField,
                     hint: "tab",
                     description: "next field",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Code(KeyCode::BackTab),
                         KeyTrigger::Modified(KeyModifiers::SHIFT, KeyCode::BackTab),
                     ],
@@ -437,7 +385,7 @@ impl Keymap {
                     description: "prev field",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Char('q'),
                         KeyTrigger::Code(KeyCode::Esc),
                         KeyTrigger::Code(KeyCode::Backspace),
@@ -447,7 +395,7 @@ impl Keymap {
                     description: "back",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Modified(
+                    triggers: smallvec![KeyTrigger::Modified(
                         KeyModifiers::CONTROL,
                         KeyCode::Char('c'),
                     )],
@@ -456,37 +404,37 @@ impl Keymap {
                     description: "quit",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('m')],
+                    triggers: smallvec![KeyTrigger::Char('m')],
                     action: Action::ToggleMethod,
                     hint: "m",
                     description: "method",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('s')],
+                    triggers: smallvec![KeyTrigger::Char('s')],
                     action: Action::SendRequest,
                     hint: "s",
                     description: "send",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('v')],
+                    triggers: smallvec![KeyTrigger::Char('v')],
                     action: Action::CycleViewMode,
                     hint: "v",
                     description: "view mode",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('u')],
+                    triggers: smallvec![KeyTrigger::Char('u')],
                     action: Action::JumpToUrl,
                     hint: "u",
                     description: "edit URL",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('h')],
+                    triggers: smallvec![KeyTrigger::Char('h')],
                     action: Action::FocusHeaders,
                     hint: "h",
                     description: "headers",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('b')],
+                    triggers: smallvec![KeyTrigger::Char('b')],
                     action: Action::JumpToBody,
                     hint: "b",
                     description: "edit body",
@@ -494,8 +442,7 @@ impl Keymap {
             ],
         });
 
-        // ── Request — navigation, scrollable (any focus that has scroll) ──────
-        // j/k/arrows/pgup/pgdown for scroll; overridden by header-focused rules below.
+        // ── Request — navigation, scrollable fields ───────────────────────────
         for &focus in &[
             FocusableField::Body,
             FocusableField::RequestEvents,
@@ -503,29 +450,29 @@ impl Keymap {
         ] {
             rules.push(ContextRule {
                 screen: CurrentScreen::Request,
-                editing: None,
+                editing: EditingMatch::Navigation,
                 focus: Some(focus),
                 bindings: vec![
                     Binding {
-                        triggers: vec![KeyTrigger::Char('j'), KeyTrigger::Code(KeyCode::Down)],
+                        triggers: smallvec![KeyTrigger::Char('j'), KeyTrigger::Code(KeyCode::Down)],
                         action: Action::ScrollDown,
                         hint: "↓/j",
                         description: "scroll down",
                     },
                     Binding {
-                        triggers: vec![KeyTrigger::Char('k'), KeyTrigger::Code(KeyCode::Up)],
+                        triggers: smallvec![KeyTrigger::Char('k'), KeyTrigger::Code(KeyCode::Up)],
                         action: Action::ScrollUp,
                         hint: "↑/k",
                         description: "scroll up",
                     },
                     Binding {
-                        triggers: vec![KeyTrigger::Code(KeyCode::PageDown)],
+                        triggers: smallvec![KeyTrigger::Code(KeyCode::PageDown)],
                         action: Action::PageDown,
                         hint: "PgDn",
                         description: "page down",
                     },
                     Binding {
-                        triggers: vec![KeyTrigger::Code(KeyCode::PageUp)],
+                        triggers: smallvec![KeyTrigger::Code(KeyCode::PageUp)],
                         action: Action::PageUp,
                         hint: "PgUp",
                         description: "page up",
@@ -534,26 +481,26 @@ impl Keymap {
             });
         }
 
-        // Url focus: e/enter to edit
+        // Url focus
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: Some(FocusableField::Url),
             bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
+                triggers: smallvec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
                 action: Action::EditFocusedField,
                 hint: "e/enter",
                 description: "edit",
             }],
         });
 
-        // Body focus: e/enter to edit + scroll
+        // Body focus
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: Some(FocusableField::Body),
             bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
+                triggers: smallvec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
                 action: Action::EditFocusedField,
                 hint: "e/enter",
                 description: "edit",
@@ -563,47 +510,47 @@ impl Keymap {
         // ── Request — navigation, Headers focused ─────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: Some(FocusableField::Headers),
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Char('j'), KeyTrigger::Code(KeyCode::Down)],
+                    triggers: smallvec![KeyTrigger::Char('j'), KeyTrigger::Code(KeyCode::Down)],
                     action: Action::SelectNextHeader,
                     hint: "↓/j",
                     description: "next header",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('k'), KeyTrigger::Code(KeyCode::Up)],
+                    triggers: smallvec![KeyTrigger::Char('k'), KeyTrigger::Code(KeyCode::Up)],
                     action: Action::SelectPreviousHeader,
                     hint: "↑/k",
                     description: "prev header",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::PageDown)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::PageDown)],
                     action: Action::SelectNextHeader,
                     hint: "PgDn",
                     description: "next header",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::PageUp)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::PageUp)],
                     action: Action::SelectPreviousHeader,
                     hint: "PgUp",
                     description: "prev header",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Char('e'), KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::EditSelectedHeader,
                     hint: "e/enter",
                     description: "edit",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('a')],
+                    triggers: smallvec![KeyTrigger::Char('a')],
                     action: Action::AddHeader,
                     hint: "a",
                     description: "add",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('d')],
+                    triggers: smallvec![KeyTrigger::Char('d')],
                     action: Action::DeleteHeader,
                     hint: "d",
                     description: "delete",
@@ -612,27 +559,25 @@ impl Keymap {
         });
 
         // ── Request — navigation, Response focused ────────────────────────────
-        // f for jq filter; p for prefix regex; s_r for suffix regex — only
-        // active when response is focused (handler guards on view mode).
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: None,
+            editing: EditingMatch::Navigation,
             focus: Some(FocusableField::Response),
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Char('f')],
+                    triggers: smallvec![KeyTrigger::Char('f')],
                     action: Action::EditJqFilter,
                     hint: "f",
                     description: "jq filter",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('p')],
+                    triggers: smallvec![KeyTrigger::Char('p')],
                     action: Action::EditStreamPrefixRegex,
                     hint: "p",
                     description: "prefix regex",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Char('x')],
+                    triggers: smallvec![KeyTrigger::Char('x')],
                     action: Action::EditStreamSuffixRegex,
                     hint: "x",
                     description: "suffix regex",
@@ -643,11 +588,11 @@ impl Keymap {
         // ── Editing mode — any field ──────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(None), // any editing field
+            editing: EditingMatch::AnyField,
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Code(KeyCode::Esc),
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('c')),
                     ],
@@ -656,7 +601,7 @@ impl Keymap {
                     description: "cancel",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Backspace)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Backspace)],
                     action: Action::DeleteChar,
                     hint: "⌫",
                     description: "delete char",
@@ -664,34 +609,32 @@ impl Keymap {
             ],
         });
 
-        // ── Editing mode — specific fields ────────────────────────────────────
-
-        // URL editing
+        // ── URL editing ────────────────────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(Some(EditingField::Url)),
+            editing: EditingMatch::SpecificField(EditingField::Url),
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::ConfirmEdit,
                     hint: "enter",
                     description: "confirm",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Left)],
                     action: Action::CursorLeft,
                     hint: "←",
                     description: "cursor left",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Right)],
                     action: Action::CursorRight,
                     hint: "→",
                     description: "cursor right",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
                     ],
@@ -700,7 +643,7 @@ impl Keymap {
                     description: "word left",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
                     ],
@@ -709,28 +652,27 @@ impl Keymap {
                     description: "word right",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Home)],
                     action: Action::CursorHome,
                     hint: "home",
                     description: "line start",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::End)],
                     action: Action::CursorEnd,
                     hint: "end",
                     description: "line end",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Delete)],
                     action: Action::DeleteNextChar,
                     hint: "del",
                     description: "delete next",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
-                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
                     ],
                     action: Action::DeleteWordBackward,
@@ -738,7 +680,7 @@ impl Keymap {
                     description: "delete word",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
                     ],
@@ -749,20 +691,20 @@ impl Keymap {
             ],
         });
 
-        // Body editing
+        // ── Body editing ───────────────────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(Some(EditingField::Body)),
+            editing: EditingMatch::SpecificField(EditingField::Body),
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::InsertNewline,
                     hint: "enter",
                     description: "newline",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Modified(
+                    triggers: smallvec![KeyTrigger::Modified(
                         KeyModifiers::CONTROL,
                         KeyCode::Char('s'),
                     )],
@@ -771,19 +713,19 @@ impl Keymap {
                     description: "save",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Left)],
                     action: Action::CursorLeft,
                     hint: "←",
                     description: "cursor left",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Right)],
                     action: Action::CursorRight,
                     hint: "→",
                     description: "cursor right",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
                     ],
@@ -792,7 +734,7 @@ impl Keymap {
                     description: "word left",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
                     ],
@@ -801,28 +743,27 @@ impl Keymap {
                     description: "word right",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Home)],
                     action: Action::CursorHome,
                     hint: "home",
                     description: "line start",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::End)],
                     action: Action::CursorEnd,
                     hint: "end",
                     description: "line end",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Delete)],
                     action: Action::DeleteNextChar,
                     hint: "del",
                     description: "delete next",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
-                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
                     ],
                     action: Action::DeleteWordBackward,
@@ -830,7 +771,7 @@ impl Keymap {
                     description: "delete word",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
                     ],
@@ -841,32 +782,32 @@ impl Keymap {
             ],
         });
 
-        // JsonFilter editing
+        // ── JsonFilter editing ─────────────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(Some(EditingField::JsonFilter)),
+            editing: EditingMatch::SpecificField(EditingField::JsonFilter),
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::ConfirmEdit,
                     hint: "enter",
                     description: "apply",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Left)],
                     action: Action::CursorLeft,
                     hint: "←",
                     description: "cursor left",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Right)],
                     action: Action::CursorRight,
                     hint: "→",
                     description: "cursor right",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
                     ],
@@ -875,7 +816,7 @@ impl Keymap {
                     description: "word left",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
                     ],
@@ -884,28 +825,27 @@ impl Keymap {
                     description: "word right",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Home)],
                     action: Action::CursorHome,
                     hint: "home",
                     description: "line start",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::End)],
                     action: Action::CursorEnd,
                     hint: "end",
                     description: "line end",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Delete)],
                     action: Action::DeleteNextChar,
                     hint: "del",
                     description: "delete next",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
-                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
                     ],
                     action: Action::DeleteWordBackward,
@@ -913,7 +853,7 @@ impl Keymap {
                     description: "delete word",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
                     ],
@@ -924,32 +864,32 @@ impl Keymap {
             ],
         });
 
-        // StreamPrefixRegex editing
+        // ── StreamPrefixRegex editing ──────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(Some(EditingField::StreamPrefixRegex)),
+            editing: EditingMatch::SpecificField(EditingField::StreamPrefixRegex),
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::ConfirmEdit,
                     hint: "enter",
                     description: "apply",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Left)],
                     action: Action::CursorLeft,
                     hint: "←",
                     description: "cursor left",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Right)],
                     action: Action::CursorRight,
                     hint: "→",
                     description: "cursor right",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
                     ],
@@ -958,7 +898,7 @@ impl Keymap {
                     description: "word left",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
                     ],
@@ -967,28 +907,27 @@ impl Keymap {
                     description: "word right",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Home)],
                     action: Action::CursorHome,
                     hint: "home",
                     description: "line start",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::End)],
                     action: Action::CursorEnd,
                     hint: "end",
                     description: "line end",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Delete)],
                     action: Action::DeleteNextChar,
                     hint: "del",
                     description: "delete next",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
-                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
                     ],
                     action: Action::DeleteWordBackward,
@@ -996,7 +935,7 @@ impl Keymap {
                     description: "delete word",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
                     ],
@@ -1007,32 +946,32 @@ impl Keymap {
             ],
         });
 
-        // StreamSuffixRegex editing
+        // ── StreamSuffixRegex editing ──────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(Some(EditingField::StreamSuffixRegex)),
+            editing: EditingMatch::SpecificField(EditingField::StreamSuffixRegex),
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::ConfirmEdit,
                     hint: "enter",
                     description: "apply",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Left)],
                     action: Action::CursorLeft,
                     hint: "←",
                     description: "cursor left",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Right)],
                     action: Action::CursorRight,
                     hint: "→",
                     description: "cursor right",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
                     ],
@@ -1041,7 +980,7 @@ impl Keymap {
                     description: "word left",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
                     ],
@@ -1050,28 +989,27 @@ impl Keymap {
                     description: "word right",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Home)],
                     action: Action::CursorHome,
                     hint: "home",
                     description: "line start",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::End)],
                     action: Action::CursorEnd,
                     hint: "end",
                     description: "line end",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Delete)],
                     action: Action::DeleteNextChar,
                     hint: "del",
                     description: "delete next",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
-                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
                     ],
                     action: Action::DeleteWordBackward,
@@ -1079,7 +1017,7 @@ impl Keymap {
                     description: "delete word",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
                     ],
@@ -1090,14 +1028,14 @@ impl Keymap {
             ],
         });
 
-        // Headers editing
+        // ── Headers editing ────────────────────────────────────────────────────
         rules.push(ContextRule {
             screen: CurrentScreen::Request,
-            editing: Some(Some(EditingField::Headers)),
+            editing: EditingMatch::SpecificField(EditingField::Headers),
             focus: None,
             bindings: vec![
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Code(KeyCode::Tab),
                         KeyTrigger::Code(KeyCode::BackTab),
                         KeyTrigger::Modified(KeyModifiers::SHIFT, KeyCode::BackTab),
@@ -1107,37 +1045,37 @@ impl Keymap {
                     description: "toggle key/value",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Enter)],
                     action: Action::ConfirmEdit,
                     hint: "enter",
                     description: "confirm",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Down)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Down)],
                     action: Action::AutocompleteDown,
                     hint: "↓",
                     description: "next suggestion",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Up)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Up)],
                     action: Action::AutocompleteUp,
                     hint: "↑",
                     description: "prev suggestion",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Left)],
                     action: Action::CursorLeft,
                     hint: "←",
                     description: "cursor left",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Right)],
                     action: Action::CursorRight,
                     hint: "→",
                     description: "cursor right",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
                     ],
@@ -1146,7 +1084,7 @@ impl Keymap {
                     description: "word left",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
                     ],
@@ -1155,25 +1093,25 @@ impl Keymap {
                     description: "word right",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Home)],
                     action: Action::CursorHome,
                     hint: "home",
                     description: "line start",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::End)],
                     action: Action::CursorEnd,
                     hint: "end",
                     description: "line end",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::Delete)],
                     action: Action::DeleteNextChar,
                     hint: "del",
                     description: "delete next",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
@@ -1183,7 +1121,7 @@ impl Keymap {
                     description: "delete word",
                 },
                 Binding {
-                    triggers: vec![
+                    triggers: smallvec![
                         KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
                         KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
                     ],
@@ -1192,13 +1130,13 @@ impl Keymap {
                     description: "delete word forward",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::PageUp)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::PageUp)],
                     action: Action::ScrollUp,
                     hint: "⇞",
                     description: "scroll up",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::PageDown)],
+                    triggers: smallvec![KeyTrigger::Code(KeyCode::PageDown)],
                     action: Action::ScrollDown,
                     hint: "⇟",
                     description: "scroll down",
@@ -1262,8 +1200,6 @@ mod tests {
             focus: FocusableField::Url,
         }
     }
-
-    // ── Main screen ───────────────────────────────────────────────────────────
 
     #[test]
     fn main_j_selects_next() {
@@ -1337,8 +1273,6 @@ mod tests {
         assert_eq!(km.resolve(&ctx, &ctrl('c')), Some(Action::TriggerExit));
     }
 
-    // ── Exiting screen ────────────────────────────────────────────────────────
-
     #[test]
     fn exiting_y_confirms() {
         let km = Keymap::default();
@@ -1392,8 +1326,6 @@ mod tests {
             Some(Action::CancelExit)
         );
     }
-
-    // ── Request nav — global ──────────────────────────────────────────────────
 
     #[test]
     fn request_tab_focuses_next() {
@@ -1462,8 +1394,6 @@ mod tests {
         assert_eq!(km.resolve(&ctx, &ctrl('c')), Some(Action::TriggerExit));
     }
 
-    // ── Request nav — scrollable fields ──────────────────────────────────────
-
     #[test]
     fn body_j_scrolls_down() {
         let km = Keymap::default();
@@ -1498,8 +1428,6 @@ mod tests {
         let ctx = nav_ctx(CurrentScreen::Request, FocusableField::Response);
         assert_eq!(km.resolve(&ctx, &char_key('j')), Some(Action::ScrollDown));
     }
-
-    // ── Request nav — Headers focused ─────────────────────────────────────────
 
     #[test]
     fn headers_j_selects_next_header() {
@@ -1549,16 +1477,12 @@ mod tests {
         );
     }
 
-    // ── Response focused ──────────────────────────────────────────────────────
-
     #[test]
     fn response_f_edits_jq_filter() {
         let km = Keymap::default();
         let ctx = nav_ctx(CurrentScreen::Request, FocusableField::Response);
         assert_eq!(km.resolve(&ctx, &char_key('f')), Some(Action::EditJqFilter));
     }
-
-    // ── Editing mode ──────────────────────────────────────────────────────────
 
     #[test]
     fn editing_esc_cancels() {
@@ -1632,8 +1556,6 @@ mod tests {
         );
     }
 
-    // ── bindings_for deduplication ────────────────────────────────────────────
-
     #[test]
     fn bindings_for_body_no_duplicate_scroll_actions() {
         let km = Keymap::default();
@@ -1645,8 +1567,6 @@ mod tests {
             .count();
         assert_eq!(scroll_down_count, 1, "ScrollDown should appear only once");
     }
-
-    // ── format_hint_line ──────────────────────────────────────────────────────
 
     #[test]
     fn hint_line_for_main_includes_quit() {
@@ -1663,8 +1583,6 @@ mod tests {
         let hints = km.format_hint_line(&ctx);
         assert!(hints.contains("scroll"), "expected 'scroll' in: {hints}");
     }
-
-    // ── focus_shortcut_for_field ──────────────────────────────────────────────
 
     #[test]
     fn focus_shortcut_for_url() {
@@ -1689,10 +1607,6 @@ mod tests {
         assert!(shortcuts.is_empty());
     }
 
-    // ── field_bindings_for ────────────────────────────────────────────────────
-
-    /// When Body is focused, field_bindings_for should return scroll bindings
-    /// but NOT global ones like Tab or q/Esc (GoBack).
     #[test]
     fn field_bindings_for_body_includes_scroll_not_global() {
         let km = Keymap::default();
@@ -1713,8 +1627,6 @@ mod tests {
         );
     }
 
-    /// When Headers is focused, field_bindings_for returns header-specific
-    /// actions (AddHeader, DeleteHeader, etc.) but not global ones.
     #[test]
     fn field_bindings_for_headers_includes_header_actions_not_global() {
         let km = Keymap::default();
@@ -1735,8 +1647,6 @@ mod tests {
         );
     }
 
-    /// When URL is focused, field_bindings_for returns Enter-to-edit binding
-    /// but NOT global ones like Tab or GoBack.
     #[test]
     fn field_bindings_for_url_nav_has_edit_not_global() {
         let km = Keymap::default();
@@ -1757,8 +1667,6 @@ mod tests {
         );
     }
 
-    /// Editing Body: field_bindings_for returns editing-mode actions
-    /// (SaveBody, InsertNewline, CancelEdit) but not global nav ones.
     #[test]
     fn field_bindings_for_editing_body_includes_save_and_newline() {
         let km = Keymap::default();

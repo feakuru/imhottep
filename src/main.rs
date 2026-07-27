@@ -15,7 +15,7 @@ mod keymap;
 pub mod http_client;
 mod ui;
 use crate::{
-    app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode},
+    app::{App, CurrentScreen, EditingField, FocusableField, HeaderField, ResponseViewMode},
     keymap::{Action, Action::EditStreamPrefixRegex, Action::EditStreamSuffixRegex},
     ui::ui,
 };
@@ -111,27 +111,29 @@ where
                         if let Some(editing) = app.editing_field {
                             match editing {
                                 EditingField::Headers => {
-                                    if app.editing_header_key {
+                                    if app.header_field == HeaderField::Key {
                                         app.header_key_buffer.insert(app.header_key_cursor, c);
                                         app.header_key_cursor += 1;
-                                        app.header_autocomplete_selected = 0;
+                                        if let Some(ref mut ac) = app.header_autocomplete {
+                                            ac.selected = 0;
+                                        }
                                     } else {
                                         app.header_value_buffer.insert(app.header_value_cursor, c);
                                         app.header_value_cursor += 1;
                                     }
-                                    app.headers_scroll = u16::MAX;
+                                    app.headers_scroll = crate::app::SCROLL_TO_END;
                                 }
                                 EditingField::Url => {
                                     app.input_buffer.insert(app.cursor_pos, c);
                                     app.cursor_pos += 1;
-                                    app.url_h_scroll = u16::MAX;
+                                    app.url_h_scroll = crate::app::SCROLL_TO_END;
                                 }
                                 EditingField::JsonFilter
                                 | EditingField::StreamPrefixRegex
                                 | EditingField::StreamSuffixRegex => {
                                     app.input_buffer.insert(app.cursor_pos, c);
                                     app.cursor_pos += 1;
-                                    app.filter_h_scroll = u16::MAX;
+                                    app.filter_h_scroll = crate::app::SCROLL_TO_END;
                                 }
                                 EditingField::Body => {
                                     app.input_buffer.insert(app.cursor_pos, c);
@@ -297,17 +299,16 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             app.header_key_cursor = 0;
             app.header_value_buffer.clear();
             app.header_value_cursor = 0;
-            app.editing_header_key = true;
+            app.header_field = HeaderField::Key;
             app.editing_existing_header = None;
-            app.header_autocomplete_visible = false;
-            app.header_autocomplete_selected = 0;
+            app.header_autocomplete = None;
         }
         Action::ConfirmEdit => {
             match app.editing_field {
                 Some(EditingField::Url) => {
                     let url = app.input_buffer.clone();
                     if let Some(request) = app.get_current_request_mut() {
-                        request.url = url;
+                        request.url = crate::http_client::UrlString::new(url);
                     }
                     app.editing_field = None;
                     app.input_buffer.clear();
@@ -315,7 +316,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 Some(EditingField::JsonFilter) => {
                     let val = app.input_buffer.clone();
                     if let Some(request) = app.get_current_request_mut() {
-                        request.jq_filter = val;
+                        request.jq_filter = crate::http_client::JqFilter::new(val);
                     }
                     app.editing_field = None;
                     app.input_buffer.clear();
@@ -328,7 +329,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 Some(EditingField::StreamPrefixRegex) => {
                     let val = app.input_buffer.clone();
                     if let Some(request) = app.get_current_request_mut() {
-                        request.stream_prefix_regex = val;
+                        request.stream_prefix_regex = crate::http_client::RegexPattern::new(val);
                     }
                     app.editing_field = None;
                     app.input_buffer.clear();
@@ -338,7 +339,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 Some(EditingField::StreamSuffixRegex) => {
                     let val = app.input_buffer.clone();
                     if let Some(request) = app.get_current_request_mut() {
-                        request.stream_suffix_regex = val;
+                        request.stream_suffix_regex = crate::http_client::RegexPattern::new(val);
                     }
                     app.editing_field = None;
                     app.input_buffer.clear();
@@ -346,16 +347,13 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                     app.reprocess_streamed_jq();
                 }
                 Some(EditingField::Headers) => {
-                    // If autocomplete is visible, apply selection
-                    if app.header_autocomplete_visible {
+                    if app.header_autocomplete.is_some() {
                         let suggestions = app.get_filtered_header_suggestions();
                         app.apply_autocomplete_selection(&suggestions);
-                    } else if app.editing_header_key {
-                        // Move to value field
-                        app.editing_header_key = false;
-                        app.header_autocomplete_visible = false;
+                    } else if app.header_field == HeaderField::Key {
+                        app.header_field = HeaderField::Value;
+                        app.header_autocomplete = None;
                     } else {
-                        // Save header
                         let key = app.header_key_buffer.clone();
                         let value = app.header_value_buffer.clone();
                         let old_key = app.editing_existing_header.clone();
@@ -370,10 +368,9 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                         app.editing_field = None;
                         app.header_key_buffer.clear();
                         app.header_value_buffer.clear();
-                        app.editing_header_key = true;
+                        app.header_field = HeaderField::Key;
                         app.editing_existing_header = None;
-                        app.header_autocomplete_visible = false;
-                        app.header_autocomplete_selected = 0;
+                        app.header_autocomplete = None;
                     }
                 }
                 _ => {}
@@ -381,9 +378,15 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
         }
         Action::ToggleHeaderKeyValue => {
             if app.editing_field == Some(EditingField::Headers) {
-                app.editing_header_key = !app.editing_header_key;
-                app.header_autocomplete_visible = app.editing_header_key;
-                app.header_autocomplete_selected = 0;
+                app.header_field = match app.header_field {
+                    HeaderField::Key => HeaderField::Value,
+                    HeaderField::Value => HeaderField::Key,
+                };
+                if app.header_field == HeaderField::Key {
+                    app.header_autocomplete = Some(crate::app::AutocompleteState { selected: 0 });
+                } else {
+                    app.header_autocomplete = None;
+                }
             }
         }
         Action::InsertNewline => {
@@ -402,17 +405,19 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
-                            if app.header_key_cursor > 0 {
-                                app.header_key_buffer.remove(app.header_key_cursor - 1);
-                                app.header_key_cursor -= 1;
-                                app.header_autocomplete_selected = 0;
+                    if app.header_field == HeaderField::Key {
+                        if app.header_key_cursor > 0 {
+                            app.header_key_buffer.remove(app.header_key_cursor - 1);
+                            app.header_key_cursor -= 1;
+                            if let Some(ref mut ac) = app.header_autocomplete {
+                                ac.selected = 0;
                             }
-                        } else if app.header_value_cursor > 0 {
+                        }
+                    } else if app.header_value_cursor > 0 {
                             app.header_value_buffer.remove(app.header_value_cursor - 1);
                             app.header_value_cursor -= 1;
                         }
-                        app.headers_scroll = u16::MAX;
+                        app.headers_scroll = crate::app::SCROLL_TO_END;
                     }
                     EditingField::Url
                     | EditingField::JsonFilter
@@ -424,11 +429,11 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                             app.cursor_pos -= 1;
                         }
                         match editing {
-                            EditingField::Url => app.url_h_scroll = u16::MAX,
+                            EditingField::Url => app.url_h_scroll = crate::app::SCROLL_TO_END,
                             EditingField::JsonFilter
                             | EditingField::StreamPrefixRegex
                             | EditingField::StreamSuffixRegex => {
-                                app.filter_h_scroll = u16::MAX;
+                                app.filter_h_scroll = crate::app::SCROLL_TO_END;
                             }
                             _ => {}
                         }
@@ -440,7 +445,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             if app.header_key_cursor < app.header_key_buffer.len() {
                                 app.header_key_buffer.remove(app.header_key_cursor);
                             }
@@ -461,40 +466,19 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 if *cursor == 0 {
                     return;
                 }
-                let before = &buf[..*cursor];
-                let mut end = before.len();
-                let chars: Vec<char> = before.chars().rev().collect();
-                let mut i = 0;
-                // Skip trailing whitespace
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                    end -= 1;
-                }
-                if i >= chars.len() {
-                    *cursor = 0;
-                    return;
-                }
-                let is_alnum = chars[i].is_alphanumeric();
-                while i < chars.len()
-                    && !chars[i].is_whitespace()
-                    && chars[i].is_alphanumeric() == is_alnum
-                {
-                    i += 1;
-                    end -= 1;
-                }
-                let keep_until = end;
-                buf.drain(keep_until..*cursor);
-                *cursor = keep_until;
+                let end = crate::app::word_boundary_before(buf, *cursor);
+                buf.drain(end..*cursor);
+                *cursor = end;
             };
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             delete_before(&mut app.header_key_buffer, &mut app.header_key_cursor);
                         } else {
                             delete_before(&mut app.header_value_buffer, &mut app.header_value_cursor);
                         }
-                        app.headers_scroll = u16::MAX;
+                        app.headers_scroll = crate::app::SCROLL_TO_END;
                     }
                     _ => {
                         delete_before(&mut app.input_buffer, &mut app.cursor_pos);
@@ -507,29 +491,13 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 if *cursor >= buf.len() {
                     return;
                 }
-                let after = &buf[*cursor..];
-                let chars: Vec<char> = after.chars().collect();
-                let mut i = 0;
-                // Skip leading whitespace
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return;
-                }
-                let is_alnum = chars[i].is_alphanumeric();
-                while i < chars.len()
-                    && !chars[i].is_whitespace()
-                    && chars[i].is_alphanumeric() == is_alnum
-                {
-                    i += 1;
-                }
-                buf.drain(*cursor..*cursor + i);
+                let end = crate::app::word_boundary_after(buf, *cursor);
+                buf.drain(*cursor..end);
             };
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             delete_forward(
                                 &mut app.header_key_buffer,
                                 &mut app.header_key_cursor,
@@ -540,7 +508,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                                 &mut app.header_value_cursor,
                             );
                         }
-                        app.headers_scroll = u16::MAX;
+                        app.headers_scroll = crate::app::SCROLL_TO_END;
                     }
                     _ => delete_forward(&mut app.input_buffer, &mut app.cursor_pos),
                 }
@@ -550,9 +518,9 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key && app.header_key_cursor > 0 {
+                        if app.header_field == HeaderField::Key && app.header_key_cursor > 0 {
                             app.header_key_cursor -= 1;
-                        } else if !app.editing_header_key && app.header_value_cursor > 0 {
+                        } else if app.header_field == HeaderField::Value && app.header_value_cursor > 0 {
                             app.header_value_cursor -= 1;
                         }
                     }
@@ -568,11 +536,11 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key
+                        if app.header_field == HeaderField::Key
                             && app.header_key_cursor < app.header_key_buffer.len()
                         {
                             app.header_key_cursor += 1;
-                        } else if !app.editing_header_key
+                        } else if app.header_field == HeaderField::Value
                             && app.header_value_cursor < app.header_value_buffer.len()
                         {
                             app.header_value_cursor += 1;
@@ -591,33 +559,12 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 if *cursor == 0 {
                     return;
                 }
-                let before = &buf[..*cursor];
-                let mut end = before.len();
-                let chars: Vec<char> = before.chars().rev().collect();
-                let mut i = 0;
-                // Skip trailing whitespace
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                    end -= 1;
-                }
-                if i >= chars.len() {
-                    *cursor = 0;
-                    return;
-                }
-                // Determine the category of the first non-whitespace char
-                let is_alnum = chars[i].is_alphanumeric();
-                // Skip chars of the same category (alnum or non-alnum)
-                while i < chars.len() && !chars[i].is_whitespace() && chars[i].is_alphanumeric() == is_alnum
-                {
-                    i += 1;
-                    end -= 1;
-                }
-                *cursor = end;
+                *cursor = crate::app::word_boundary_before(buf, *cursor);
             };
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             word_left(&app.header_key_buffer, &mut app.header_key_cursor);
                         } else {
                             word_left(&app.header_value_buffer, &mut app.header_value_cursor);
@@ -629,34 +576,16 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
         }
         Action::CursorWordRight => {
             let word_right = |buf: &str, cursor: &mut usize| {
-                let bytes = buf.len();
-                if *cursor >= bytes {
+                if *cursor >= buf.len() {
+                    *cursor = buf.len();
                     return;
                 }
-                let after = &buf[*cursor..];
-                let chars: Vec<char> = after.chars().collect();
-                let mut i = 0;
-                // Skip leading whitespace
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    *cursor = bytes;
-                    return;
-                }
-                // Determine the category
-                let is_alnum = chars[i].is_alphanumeric();
-                // Skip chars of the same category
-                while i < chars.len() && !chars[i].is_whitespace() && chars[i].is_alphanumeric() == is_alnum
-                {
-                    i += 1;
-                }
-                *cursor += i;
+                *cursor = crate::app::word_boundary_after(buf, *cursor);
             };
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             word_right(&app.header_key_buffer, &mut app.header_key_cursor);
                         } else {
                             word_right(&app.header_value_buffer, &mut app.header_value_cursor);
@@ -670,7 +599,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             app.header_key_cursor = 0;
                         } else {
                             app.header_value_cursor = 0;
@@ -684,7 +613,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             if let Some(editing) = app.editing_field {
                 match editing {
                     EditingField::Headers => {
-                        if app.editing_header_key {
+                        if app.header_field == HeaderField::Key {
                             app.header_key_cursor = app.header_key_buffer.len();
                         } else {
                             app.header_value_cursor = app.header_value_buffer.len();
@@ -696,7 +625,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
         }
         Action::AutocompleteDown => {
             if app.editing_field == Some(EditingField::Headers)
-                && app.header_autocomplete_visible
+                && app.header_autocomplete.is_some()
             {
                 let suggestions = app.get_filtered_header_suggestions();
                 app.select_next_autocomplete(suggestions.len());
@@ -704,7 +633,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
         }
         Action::AutocompleteUp => {
             if app.editing_field == Some(EditingField::Headers)
-                && app.header_autocomplete_visible
+                && app.header_autocomplete.is_some()
             {
                 app.select_previous_autocomplete();
             }

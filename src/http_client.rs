@@ -1,32 +1,276 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{Request, Response, body::Incoming};
+use hyper::{Request, Response, StatusCode, body::Incoming};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::ops::Deref;
 use tokio::sync::{mpsc, oneshot};
 
-// Re-export hyper's Method as HttpMethod for compatibility
 pub use hyper::Method as HttpMethod;
 
-mod http_method_serde {
-    use hyper::Method;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+// ── Newtypes ──────────────────────────────────────────────────────────────────
 
-    pub fn serialize<S: Serializer>(method: &Method, s: S) -> Result<S::Ok, S::Error> {
-        method.as_str().serialize(s)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UrlString(String);
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Method, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse::<Method>().map_err(serde::de::Error::custom)
+impl UrlString {
+    pub fn new(s: String) -> Self {
+        Self(s)
     }
 }
 
-/// Events emitted during HTTP request lifecycle
+impl Deref for UrlString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for UrlString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<UrlString> for String {
+    fn from(u: UrlString) -> String {
+        u.0
+    }
+}
+
+impl From<String> for UrlString {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl<'a> From<&'a str> for UrlString {
+    fn from(s: &'a str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HeaderName(String);
+
+impl HeaderName {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl Deref for HeaderName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HeaderName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Borrow<str> for HeaderName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for HeaderName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl<'a> From<&'a str> for HeaderName {
+    fn from(s: &'a str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HeaderValue(String);
+
+impl HeaderValue {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl Deref for HeaderValue {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Borrow<str> for HeaderValue {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for HeaderValue {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl<'a> From<&'a str> for HeaderValue {
+    fn from(s: &'a str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JqFilter(String);
+
+impl JqFilter {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl Deref for JqFilter {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for JqFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Default for JqFilter {
+    fn default() -> Self {
+        Self(".".to_string())
+    }
+}
+
+impl From<String> for JqFilter {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl<'a> From<&'a str> for JqFilter {
+    fn from(s: &'a str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegexPattern {
+    pattern: String,
+    #[serde(skip)]
+    compiled: Option<Box<Regex>>,
+}
+
+impl RegexPattern {
+    pub fn new(pattern: String) -> Self {
+        let compiled = Regex::new(&pattern).ok().map(Box::new);
+        Self { pattern, compiled }
+    }
+
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    pub fn compiled(&self) -> Option<&Regex> {
+        self.compiled.as_deref()
+    }
+
+    pub fn compile(&self) -> Result<Regex, regex::Error> {
+        Regex::new(&self.pattern)
+    }
+
+    pub fn set_pattern(&mut self, pattern: String) {
+        self.pattern = pattern;
+        self.compiled = Regex::new(&self.pattern).ok().map(Box::new);
+    }
+}
+
+impl Deref for RegexPattern {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.pattern
+    }
+}
+
+impl fmt::Display for RegexPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.pattern.fmt(f)
+    }
+}
+
+impl PartialEq for RegexPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
+}
+
+impl Eq for RegexPattern {}
+
+impl From<String> for RegexPattern {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl<'a> From<&'a str> for RegexPattern {
+    fn from(s: &'a str) -> Self {
+        Self::new(s.to_owned())
+    }
+}
+
+fn default_jq_filter() -> JqFilter {
+    JqFilter::default()
+}
+
+fn is_default_jq_filter(f: &JqFilter) -> bool {
+    f.deref() == "."
+}
+
+
+fn default_prefix_regex() -> RegexPattern {
+    RegexPattern::new(r"^\w+:\s*".to_string())
+}
+
+fn is_default_prefix_regex(r: &RegexPattern) -> bool {
+    r.pattern() == r"^\w+:\s*"
+}
+
+fn default_suffix_regex() -> RegexPattern {
+    RegexPattern::new(r"\s*$".to_string())
+}
+
+fn is_default_suffix_regex(r: &RegexPattern) -> bool {
+    r.pattern() == r"\s*$"
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub enum RequestEvent {
     Started,
@@ -39,7 +283,7 @@ pub enum RequestEvent {
     RequestSent,
     WaitingForResponse,
     ReceivingHeaders,
-    HeadersReceived(u16), // status code
+    HeadersReceived(u16),
     BodyChunk(String),
     Completed(usize),
     TemporaryConnectionProblem(String),
@@ -72,56 +316,47 @@ impl fmt::Display for RequestEvent {
     }
 }
 
-/// Represents an HTTP request to be saved/loaded and sent
+// ── HTTP request ──────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRequest {
     #[serde(with = "http_method_serde")]
     pub method: HttpMethod,
-    pub url: String,
-    pub headers: HashMap<String, String>,
+    pub url: UrlString,
+    #[serde(with = "header_map_serde")]
+    pub headers: HashMap<HeaderName, HeaderValue>,
     pub body: Option<String>,
-    /// jq filter expression used in the Json / StreamedJson response view modes.
-    /// Defaults to "." when absent.
     #[serde(default = "default_jq_filter", skip_serializing_if = "is_default_jq_filter")]
-    pub jq_filter: String,
-    /// Regex stripped from the start of each streamed line before jq.
-    /// Defaults to r"^\w+:\s*" when absent.
+    pub jq_filter: JqFilter,
     #[serde(
-        default = "default_stream_prefix_regex",
-        skip_serializing_if = "is_default_stream_prefix_regex"
+        default = "default_prefix_regex",
+        skip_serializing_if = "is_default_prefix_regex",
+        with = "regex_pattern_serde"
     )]
-    pub stream_prefix_regex: String,
-    /// Regex stripped from the end of each streamed line before jq.
-    /// Defaults to r"\s*$" when absent.
+    pub stream_prefix_regex: RegexPattern,
     #[serde(
-        default = "default_stream_suffix_regex",
-        skip_serializing_if = "is_default_stream_suffix_regex"
+        default = "default_suffix_regex",
+        skip_serializing_if = "is_default_suffix_regex",
+        with = "regex_pattern_serde"
     )]
-    pub stream_suffix_regex: String,
+    pub stream_suffix_regex: RegexPattern,
 }
 
-fn default_jq_filter() -> String { ".".to_string() }
-fn is_default_jq_filter(s: &str) -> bool { s == "." }
-fn default_stream_prefix_regex() -> String { r"^\w+:\s*".to_string() }
-fn is_default_stream_prefix_regex(s: &str) -> bool { s == r"^\w+:\s*" }
-fn default_stream_suffix_regex() -> String { r"\s*$".to_string() }
-fn is_default_stream_suffix_regex(s: &str) -> bool { s == r"\s*$" }
-
 impl HttpRequest {
-    pub fn new(method: HttpMethod, url: String) -> Self {
+    pub fn new(method: HttpMethod, url: impl Into<UrlString>) -> Self {
         Self {
             method,
-            url,
+            url: url.into(),
             headers: HashMap::new(),
             body: None,
-            jq_filter: default_jq_filter(),
-            stream_prefix_regex: default_stream_prefix_regex(),
-            stream_suffix_regex: default_stream_suffix_regex(),
+            jq_filter: JqFilter::default(),
+            stream_prefix_regex: default_prefix_regex(),
+            stream_suffix_regex: default_suffix_regex(),
         }
     }
 
-    pub fn with_header(mut self, key: String, value: String) -> Self {
-        self.headers.insert(key, value);
+    pub fn with_header(mut self, key: impl Into<HeaderName>, value: impl Into<HeaderValue>) -> Self {
+        self.headers.insert(key.into(), value.into());
         self
     }
 
@@ -130,95 +365,189 @@ impl HttpRequest {
         self
     }
 
-    pub fn add_header(&mut self, key: String, value: String) {
-        self.headers.insert(key, value);
+    pub fn add_header(&mut self, key: impl Into<HeaderName>, value: impl Into<HeaderValue>) {
+        self.headers.insert(key.into(), value.into());
     }
 
     pub fn set_body(&mut self, body: String) {
         self.body = Some(body);
     }
 
-    pub fn remove_header(&mut self, key: &str) -> Option<String> {
-        self.headers.remove(key)
+    pub fn remove_header(&mut self, key: &str) -> Option<HeaderValue> {
+        let hk = key.to_lowercase();
+        let target: Vec<HeaderName> = self
+            .headers
+            .keys()
+            .filter(|k| k.to_lowercase() == hk)
+            .cloned()
+            .collect();
+        target.into_iter().next().and_then(|k| self.headers.remove(&k))
     }
 }
 
-/// Represents an HTTP response received
+// ── HTTP response ─────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
-    pub status: u16,
-    pub status_text: String,
+    pub status_code: StatusCode,
     pub headers: HashMap<String, String>,
     pub body: String,
 }
 
 impl HttpResponse {
     pub fn is_success(&self) -> bool {
-        self.status >= 200 && self.status < 300
+        self.status_code.is_success()
     }
 
     pub fn is_client_error(&self) -> bool {
-        self.status >= 400 && self.status < 500
+        self.status_code.is_client_error()
     }
 
     pub fn is_server_error(&self) -> bool {
-        self.status >= 500 && self.status < 600
+        self.status_code.is_server_error()
     }
 }
 
-/// Error types for HTTP operations
-#[derive(Debug)]
+// ── HttpError with source chaining ────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
 pub enum HttpError {
-    InvalidUrl(String),
-    InvalidHeader(String),
-    RequestFailed(String),
-    ResponseParseError(String),
+    InvalidUrl { msg: String, source: Option<Box<ErrorSource>> },
+    InvalidHeader { msg: String, source: Option<Box<ErrorSource>> },
+    RequestFailed { msg: String, source: Option<Box<ErrorSource>> },
+    ResponseParseError { msg: String, source: Option<Box<ErrorSource>> },
+}
+
+// Wrapper type so we can derive Clone on HttpError
+#[derive(Debug)]
+pub struct ErrorSource(Box<dyn Error + Send + Sync>);
+
+impl Clone for ErrorSource {
+    fn clone(&self) -> Self {
+        // For display/error purposes, we store the error message.
+        // This is lossy but enables Clone.
+        Self(Box::new(std::io::Error::new(std::io::ErrorKind::Other, self.0.to_string())))
+    }
+}
+
+impl Error for ErrorSource {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl fmt::Display for ErrorSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HttpError::InvalidUrl(msg) => write!(f, "Invalid URL: {}", msg),
-            HttpError::InvalidHeader(msg) => write!(f, "Invalid header: {}", msg),
-            HttpError::RequestFailed(msg) => write!(f, "Request failed: {}", msg),
-            HttpError::ResponseParseError(msg) => write!(f, "Response parse error: {}", msg),
+            HttpError::InvalidUrl { msg, .. } => write!(f, "Invalid URL: {}", msg),
+            HttpError::InvalidHeader { msg, .. } => write!(f, "Invalid header: {}", msg),
+            HttpError::RequestFailed { msg, .. } => write!(f, "Request failed: {}", msg),
+            HttpError::ResponseParseError { msg, .. } => write!(f, "Response parse error: {}", msg),
         }
     }
 }
 
-impl Error for HttpError {}
+impl Error for HttpError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            HttpError::InvalidUrl { source, .. }
+            | HttpError::InvalidHeader { source, .. }
+            | HttpError::RequestFailed { source, .. }
+            | HttpError::ResponseParseError { source, .. } => {
+                source.as_ref().map(|s| s as &(dyn Error + 'static))
+            }
+        }
+    }
+}
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+// ── Serde helpers ─────────────────────────────────────────────────────────────
 
-/// Send a `RequestEvent` if a channel is present. Ignores send errors (receiver
-/// may have been dropped).
+mod http_method_serde {
+    use hyper::Method;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(method: &Method, s: S) -> Result<S::Ok, S::Error> {
+        method.as_str().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Method, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<Method>().map_err(serde::de::Error::custom)
+    }
+}
+
+mod header_map_serde {
+    use crate::http_client::{HeaderName, HeaderValue};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S: Serializer>(
+        map: &HashMap<HeaderName, HeaderValue>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let raw: HashMap<&str, &str> = map
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect();
+        raw.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<HashMap<HeaderName, HeaderValue>, D::Error> {
+        let raw: HashMap<String, String> = HashMap::deserialize(d)?;
+        Ok(raw
+            .into_iter()
+            .map(|(k, v)| (HeaderName::new(k), HeaderValue::new(v)))
+            .collect())
+    }
+}
+
+mod regex_pattern_serde {
+    use crate::http_client::RegexPattern;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(r: &RegexPattern, s: S) -> Result<S::Ok, S::Error> {
+        r.pattern().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<RegexPattern, D::Error> {
+        let pattern = String::deserialize(d)?;
+        Ok(RegexPattern::new(pattern))
+    }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
 fn send_event(tx: &Option<mpsc::UnboundedSender<RequestEvent>>, event: RequestEvent) {
     if let Some(tx) = tx {
         let _ = tx.send(event);
     }
 }
 
-/// Emit a `Failed` event and convert an error message into an `HttpError`.
-fn fail<F>(tx: &Option<mpsc::UnboundedSender<RequestEvent>>, msg: String, make_err: F) -> HttpError
-where
-    F: FnOnce(String) -> HttpError,
-{
+fn fail(
+    tx: &Option<mpsc::UnboundedSender<RequestEvent>>,
+    msg: String,
+    source: Option<Box<dyn Error + Send + Sync>>,
+    variant: fn(String, Option<Box<ErrorSource>>) -> HttpError,
+) -> HttpError {
     send_event(tx, RequestEvent::Failed(msg.clone()));
-    make_err(msg)
+    variant(msg, source.map(|s| Box::new(ErrorSource(s))))
 }
 
-// ---------------------------------------------------------------------------
-// HttpClient
-// ---------------------------------------------------------------------------
+// ── HttpClient ────────────────────────────────────────────────────────────────
 
 type HyperClient = Client<
     hyper_tls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<Bytes>,
 >;
 
-/// HTTP client for executing requests
 #[derive(Clone)]
 pub struct HttpClient {
     client: HyperClient,
@@ -231,7 +560,6 @@ impl HttpClient {
         Self { client }
     }
 
-    /// Execute an HTTP request asynchronously with event notifications.
     pub async fn execute(
         &self,
         request: HttpRequest,
@@ -241,51 +569,80 @@ impl HttpClient {
 
         send_event(tx, RequestEvent::Started);
 
-        // Parse the URL
-        let uri = request
-            .url
+        let uri = url::Url::parse(&request.url)
+            .map_err(|e| {
+                fail(
+                    tx,
+                    e.to_string(),
+                    Some(Box::new(e)),
+                    |msg, source| HttpError::InvalidUrl { msg, source },
+                )
+            })?
+            .as_str()
             .parse::<hyper::Uri>()
-            .map_err(|e| fail(tx, e.to_string(), HttpError::InvalidUrl))?;
+            .map_err(|e| {
+                fail(
+                    tx,
+                    e.to_string(),
+                    Some(Box::new(e)),
+                    |msg, source| HttpError::InvalidUrl { msg, source },
+                )
+            })?;
 
-        // Emit host-resolution events
         if let Some(host) = uri.host() {
             send_event(tx, RequestEvent::ResolvingHost(host.to_string()));
         }
         send_event(tx, RequestEvent::HostResolved);
         send_event(tx, RequestEvent::Connecting);
 
-        // TLS handshake events happen during the connection phase
         let is_https = uri.scheme_str() == Some("https");
         if is_https {
             send_event(tx, RequestEvent::TlsHandshakeStarted);
             send_event(tx, RequestEvent::TlsHandshakeComplete);
         }
 
-        // Build the hyper request
         let mut req_builder = Request::builder().method(&request.method).uri(uri);
 
         for (key, value) in &request.headers {
-            req_builder = req_builder.header(
-                key.as_str(),
-                value
-                    .parse::<hyper::header::HeaderValue>()
-                    .map_err(|e| fail(tx, format!("{}: {}", key, e), HttpError::InvalidHeader))?,
-            );
+            let hv: hyper::header::HeaderValue = value
+                .parse()
+                .map_err(|e| {
+                    fail(
+                        tx,
+                        format!("{}: {}", key, e),
+                        None,
+                        |msg, source| HttpError::InvalidHeader { msg, source },
+                    )
+                })?;
+            req_builder = req_builder.header(key.as_ref() as &str, hv);
         }
 
         let body_bytes = Bytes::from(request.body.unwrap_or_default());
         let hyper_request = req_builder
             .body(Full::new(body_bytes))
-            .map_err(|e| fail(tx, e.to_string(), HttpError::RequestFailed))?;
+            .map_err(|e| {
+                fail(
+                    tx,
+                    e.to_string(),
+                    Some(Box::new(e)),
+                    |msg, source| HttpError::RequestFailed { msg, source },
+                )
+            })?;
 
         send_event(tx, RequestEvent::SendingRequest);
 
-        // Execute the request
         let response = self
             .client
             .request(hyper_request)
             .await
-            .map_err(|e| fail(tx, e.to_string(), HttpError::RequestFailed))?;
+            .map_err(|e| {
+                fail(
+                    tx,
+                    e.to_string(),
+                    Some(Box::new(e)),
+                    |msg, source| HttpError::RequestFailed { msg, source },
+                )
+            })?;
 
         send_event(tx, RequestEvent::RequestSent);
         send_event(tx, RequestEvent::WaitingForResponse);
@@ -303,26 +660,22 @@ impl HttpClient {
 
         let status = response.status();
         let status_code = status.as_u16();
-        let status_text = status.canonical_reason().unwrap_or("Unknown").to_string();
 
         send_event(tx, RequestEvent::HeadersReceived(status_code));
 
-        // Extract headers
-        let mut headers = HashMap::new();
+        let mut headers: HashMap<String, String> = HashMap::new();
         for (key, value) in response.headers() {
             if let Ok(value_str) = value.to_str() {
                 headers.insert(key.to_string(), value_str.to_string());
             }
         }
 
-        // Stream the body
         let mut accumulated_body = String::new();
 
         while let Some(next) = response.frame().await {
             match next {
                 Ok(frame) => {
                     if let Some(chunk) = frame.data_ref() {
-                        // Convert chunk to string lossily so UI can render incrementally
                         let chunk_str = String::from_utf8_lossy(chunk).into_owned();
                         accumulated_body = accumulated_body + &chunk_str;
                         send_event(tx, RequestEvent::BodyChunk(chunk_str));
@@ -341,8 +694,7 @@ impl HttpClient {
         send_event(tx, RequestEvent::Completed(accumulated_body.bytes().len()));
 
         Ok(HttpResponse {
-            status: status_code,
-            status_text,
+            status_code: status,
             headers,
             body: accumulated_body,
         })
@@ -355,11 +707,8 @@ impl Default for HttpClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HttpRuntime
-// ---------------------------------------------------------------------------
+// ── HttpRuntime ───────────────────────────────────────────────────────────────
 
-/// HTTP runtime manager that persists for the app lifetime
 pub struct HttpRuntime {
     runtime: tokio::runtime::Runtime,
     client: HttpClient,
@@ -372,8 +721,6 @@ impl HttpRuntime {
         Ok(Self { runtime, client })
     }
 
-    /// Execute an HTTP request in the background.
-    /// Returns a receiver for the result and a receiver for events.
     pub fn execute_request(
         &self,
         request: HttpRequest,
@@ -391,12 +738,6 @@ impl HttpRuntime {
         });
 
         (result_rx, event_rx)
-    }
-}
-
-impl Default for HttpRuntime {
-    fn default() -> Self {
-        Self::new().expect("Failed to create HTTP runtime")
     }
 }
 
@@ -421,63 +762,165 @@ mod tests {
         assert_eq!(HttpMethod::OPTIONS.to_string(), "OPTIONS");
     }
 
+    // ── Newtype tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_url_string_from_string() {
+        let u: UrlString = "https://example.com".into();
+        assert_eq!(&*u, "https://example.com");
+        assert_eq!(u.to_string(), "https://example.com");
+    }
+
+    #[test]
+    fn test_url_string_serde_roundtrip() {
+        let u = UrlString::new("https://example.com".to_string());
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(json, r#""https://example.com""#);
+        let back: UrlString = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn test_header_name_serde_roundtrip() {
+        let h: HeaderName = "Content-Type".into();
+        let json = serde_json::to_string(&h).unwrap();
+        assert_eq!(json, r#""Content-Type""#);
+        let back: HeaderName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn test_header_value_serde_roundtrip() {
+        let v: HeaderValue = "application/json".into();
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, r#""application/json""#);
+        let back: HeaderValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn test_jq_filter_default() {
+        let f = JqFilter::default();
+        assert_eq!(&*f, ".");
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"".""#);
+    }
+
+    #[test]
+    fn test_regex_pattern_compiles() {
+        let r = RegexPattern::new(r"^\w+:\s*".to_string());
+        assert!(r.compiled().is_some());
+        assert!(r.compile().is_ok());
+    }
+
+    #[test]
+    fn test_regex_pattern_invalid() {
+        let r = RegexPattern::new(r"[invalid".to_string());
+        assert!(r.compiled().is_none());
+        assert!(r.compile().is_err());
+    }
+
+    #[test]
+    fn test_regex_pattern_set_updates_compiled() {
+        let mut r = RegexPattern::new(r"[invalid".to_string());
+        assert!(r.compiled().is_none());
+        r.set_pattern(r"^\w+:\s*".to_string());
+        assert!(r.compiled().is_some());
+    }
+
+    #[test]
+    fn test_regex_pattern_serde_roundtrip() {
+        let r = RegexPattern::new(r"^\w+:\s*".to_string());
+        let json = serde_json::to_string(&r).unwrap();
+        // Direct struct serialization includes "pattern" field. The compiled
+        // field is skipped, so it will be None after deserialization.
+        let back: RegexPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pattern(), r.pattern());
+    }
+
+    #[test]
+    fn test_regex_pattern_custom_serde_on_request() {
+        let req = HttpRequest::new(HttpMethod::GET, "https://example.com");
+        let json = serde_json::to_string(&req).unwrap();
+        // The custom regex_pattern_serde module serializes as a plain string
+        // when used via `#[serde(with = "...")]` on HttpRequest fields.
+        let decoded: HttpRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            req.stream_prefix_regex.pattern(),
+            decoded.stream_prefix_regex.pattern()
+        );
+        assert_eq!(
+            req.stream_suffix_regex.pattern(),
+            decoded.stream_suffix_regex.pattern()
+        );
+        // Custom deserialization calls RegexPattern::new, which compiles.
+        assert!(decoded.stream_prefix_regex.compiled().is_some());
+        assert!(decoded.stream_suffix_regex.compiled().is_some());
+    }
+
     // ── HttpRequest builder ───────────────────────────────────────────────────
 
     #[test]
     fn test_http_request_builder() {
-        let req = HttpRequest::new(HttpMethod::GET, "https://example.com".to_string())
-            .with_header("Content-Type".to_string(), "application/json".to_string())
+        let req = HttpRequest::new(HttpMethod::GET, "https://example.com")
+            .with_header("Content-Type", "application/json")
             .with_body("test body".to_string());
 
         assert_eq!(req.method, HttpMethod::GET);
-        assert_eq!(req.url, "https://example.com");
+        assert_eq!(&*req.url, "https://example.com");
         assert_eq!(
-            req.headers.get("Content-Type"),
-            Some(&"application/json".to_string())
+            req.headers.get("Content-Type" as &str).map(|v| v.as_ref()),
+            Some("application/json")
         );
         assert_eq!(req.body, Some("test body".to_string()));
     }
 
     #[test]
     fn test_http_request_add_header() {
-        let mut req = HttpRequest::new(HttpMethod::POST, "https://example.com".to_string());
-        req.add_header("Authorization".to_string(), "Bearer token".to_string());
+        let mut req = HttpRequest::new(HttpMethod::POST, "https://example.com");
+        req.add_header("Authorization", "Bearer token");
 
         assert_eq!(
-            req.headers.get("Authorization"),
-            Some(&"Bearer token".to_string())
+            req.headers.get("Authorization" as &str).map(|v| v.as_ref()),
+            Some("Bearer token")
         );
     }
 
     #[test]
     fn test_http_request_add_header_overwrites_existing() {
-        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com".to_string());
-        req.add_header("X-Custom".to_string(), "first".to_string());
-        req.add_header("X-Custom".to_string(), "second".to_string());
-        assert_eq!(req.headers.get("X-Custom"), Some(&"second".to_string()));
+        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com");
+        req.add_header("X-Custom", "first");
+        req.add_header("X-Custom", "second");
+        assert_eq!(
+            req.headers.get("X-Custom" as &str).map(|v| v.as_ref()),
+            Some("second")
+        );
         assert_eq!(req.headers.len(), 1);
     }
 
     #[test]
     fn test_http_request_remove_header() {
-        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com".to_string())
-            .with_header("X-Test".to_string(), "value".to_string());
+        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com")
+            .with_header("X-Test", "value");
 
         let removed = req.remove_header("X-Test");
-        assert_eq!(removed, Some("value".to_string()));
-        assert_eq!(req.headers.get("X-Test"), None);
+        assert!(removed.is_some());
+        assert_eq!(
+            req.headers.get("X-Test" as &str),
+            None
+        );
     }
 
     #[test]
     fn test_http_request_remove_nonexistent_header_returns_none() {
-        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com".to_string());
+        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com");
         let removed = req.remove_header("Does-Not-Exist");
         assert_eq!(removed, None);
     }
 
     #[test]
     fn test_http_request_set_body() {
-        let mut req = HttpRequest::new(HttpMethod::POST, "https://example.com".to_string());
+        let mut req = HttpRequest::new(HttpMethod::POST, "https://example.com");
         req.set_body("initial body".to_string());
         assert_eq!(req.body, Some("initial body".to_string()));
 
@@ -487,21 +930,21 @@ mod tests {
 
     #[test]
     fn test_http_request_empty_body() {
-        let req = HttpRequest::new(HttpMethod::GET, "https://example.com".to_string());
+        let req = HttpRequest::new(HttpMethod::GET, "https://example.com");
         assert_eq!(req.body, None);
     }
 
     #[test]
     fn test_http_request_empty_headers() {
-        let req = HttpRequest::new(HttpMethod::GET, "https://example.com".to_string());
+        let req = HttpRequest::new(HttpMethod::GET, "https://example.com");
         assert_eq!(req.headers.len(), 0);
     }
 
     #[test]
     fn test_request_builder_chaining() {
-        let req = HttpRequest::new(HttpMethod::POST, "https://api.example.com/data".to_string())
-            .with_header("Content-Type".to_string(), "application/json".to_string())
-            .with_header("Authorization".to_string(), "Bearer token123".to_string())
+        let req = HttpRequest::new(HttpMethod::POST, "https://api.example.com/data")
+            .with_header("Content-Type", "application/json")
+            .with_header("Authorization", "Bearer token123")
             .with_body(r#"{"key": "value"}"#.to_string());
 
         assert_eq!(req.headers.len(), 2);
@@ -512,24 +955,24 @@ mod tests {
 
     #[test]
     fn test_http_request_serde_round_trip_get() {
-        let req = HttpRequest::new(HttpMethod::GET, "https://example.com/api".to_string())
-            .with_header("Accept".to_string(), "application/json".to_string());
+        let req = HttpRequest::new(HttpMethod::GET, "https://example.com/api")
+            .with_header("Accept", "application/json");
 
         let json = serde_json::to_string(&req).expect("serialization failed");
         let decoded: HttpRequest = serde_json::from_str(&json).expect("deserialization failed");
 
         assert_eq!(decoded.method, HttpMethod::GET);
-        assert_eq!(decoded.url, "https://example.com/api");
+        assert_eq!(&*decoded.url, "https://example.com/api");
         assert_eq!(
-            decoded.headers.get("Accept"),
-            Some(&"application/json".to_string())
+            decoded.headers.get("Accept" as &str).map(|v| v.as_ref()),
+            Some("application/json")
         );
         assert_eq!(decoded.body, None);
     }
 
     #[test]
     fn test_http_request_serde_round_trip_post_with_body() {
-        let req = HttpRequest::new(HttpMethod::POST, "https://api.example.com".to_string())
+        let req = HttpRequest::new(HttpMethod::POST, "https://api.example.com")
             .with_body(r#"{"name":"Alice"}"#.to_string());
 
         let json = serde_json::to_string(&req).expect("serialization failed");
@@ -550,18 +993,18 @@ mod tests {
             HttpMethod::HEAD,
             HttpMethod::OPTIONS,
         ] {
-            let req = HttpRequest::new(method.clone(), "https://example.com".to_string());
+            let req = HttpRequest::new(method.clone(), "https://example.com");
             let json = serde_json::to_string(&req).expect("serialization failed");
-            let decoded: HttpRequest = serde_json::from_str(&json).expect("deserialization failed");
+            let decoded: HttpRequest =
+                serde_json::from_str(&json).expect("deserialization failed");
             assert_eq!(decoded.method, method);
         }
     }
 
     #[test]
     fn test_http_request_serde_method_stored_as_string() {
-        let req = HttpRequest::new(HttpMethod::DELETE, "https://example.com".to_string());
+        let req = HttpRequest::new(HttpMethod::DELETE, "https://example.com");
         let json = serde_json::to_string(&req).expect("serialization failed");
-        // The method must appear as a plain string in the JSON
         assert!(
             json.contains("\"DELETE\""),
             "expected plain string method in JSON: {json}"
@@ -571,11 +1014,12 @@ mod tests {
     #[test]
     fn test_http_request_serde_vec_round_trip() {
         let requests = vec![
-            HttpRequest::new(HttpMethod::GET, "https://a.example.com".to_string()),
-            HttpRequest::new(HttpMethod::POST, "https://b.example.com".to_string())
+            HttpRequest::new(HttpMethod::GET, "https://a.example.com"),
+            HttpRequest::new(HttpMethod::POST, "https://b.example.com")
                 .with_body("data".to_string()),
         ];
-        let json = serde_json::to_string_pretty(&requests).expect("serialization failed");
+        let json =
+            serde_json::to_string_pretty(&requests).expect("serialization failed");
         let decoded: Vec<HttpRequest> =
             serde_json::from_str(&json).expect("deserialization failed");
 
@@ -590,8 +1034,7 @@ mod tests {
     #[test]
     fn test_http_response_status_checks() {
         let success_response = HttpResponse {
-            status: 200,
-            status_text: "OK".to_string(),
+            status_code: StatusCode::OK,
             headers: HashMap::new(),
             body: "".to_string(),
         };
@@ -600,8 +1043,7 @@ mod tests {
         assert!(!success_response.is_server_error());
 
         let client_error_response = HttpResponse {
-            status: 404,
-            status_text: "Not Found".to_string(),
+            status_code: StatusCode::NOT_FOUND,
             headers: HashMap::new(),
             body: "".to_string(),
         };
@@ -610,8 +1052,7 @@ mod tests {
         assert!(!client_error_response.is_server_error());
 
         let server_error_response = HttpResponse {
-            status: 500,
-            status_text: "Internal Server Error".to_string(),
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
             headers: HashMap::new(),
             body: "".to_string(),
         };
@@ -622,67 +1063,64 @@ mod tests {
 
     #[test]
     fn test_http_response_status_boundary_values() {
-        // 2xx boundaries
         let r199 = HttpResponse {
-            status: 199,
-            status_text: String::new(),
+            status_code: StatusCode::from_u16(199).unwrap(),
             headers: HashMap::new(),
             body: String::new(),
         };
         assert!(!r199.is_success());
 
         let r200 = HttpResponse {
-            status: 200,
+            status_code: StatusCode::from_u16(200).unwrap(),
             ..r199.clone()
         };
         assert!(r200.is_success());
 
         let r299 = HttpResponse {
-            status: 299,
+            status_code: StatusCode::from_u16(299).unwrap(),
             ..r199.clone()
         };
         assert!(r299.is_success());
 
         let r300 = HttpResponse {
-            status: 300,
+            status_code: StatusCode::from_u16(300).unwrap(),
             ..r199.clone()
         };
         assert!(!r300.is_success());
 
-        // 4xx boundaries
         let r399 = HttpResponse {
-            status: 399,
+            status_code: StatusCode::from_u16(399).unwrap(),
             ..r199.clone()
         };
         assert!(!r399.is_client_error());
 
         let r400 = HttpResponse {
-            status: 400,
+            status_code: StatusCode::from_u16(400).unwrap(),
             ..r199.clone()
         };
         assert!(r400.is_client_error());
 
         let r499 = HttpResponse {
-            status: 499,
+            status_code: StatusCode::from_u16(499).unwrap(),
             ..r199.clone()
         };
         assert!(r499.is_client_error());
 
         let r500 = HttpResponse {
-            status: 500,
+            status_code: StatusCode::from_u16(500).unwrap(),
             ..r199.clone()
         };
         assert!(!r500.is_client_error());
         assert!(r500.is_server_error());
 
         let r599 = HttpResponse {
-            status: 599,
+            status_code: StatusCode::from_u16(599).unwrap(),
             ..r199.clone()
         };
         assert!(r599.is_server_error());
 
         let r600 = HttpResponse {
-            status: 600,
+            status_code: StatusCode::from_u16(600).unwrap(),
             ..r199
         };
         assert!(!r600.is_server_error());
@@ -691,7 +1129,6 @@ mod tests {
     #[test]
     fn test_http_response_all_status_categories_are_mutually_exclusive_for_common_codes() {
         let codes_and_expected: &[(u16, bool, bool, bool)] = &[
-            // (status, is_success, is_client_error, is_server_error)
             (200, true, false, false),
             (201, true, false, false),
             (204, true, false, false),
@@ -707,8 +1144,7 @@ mod tests {
         ];
         for &(status, ok, ce, se) in codes_and_expected {
             let r = HttpResponse {
-                status,
-                status_text: String::new(),
+                status_code: StatusCode::from_u16(status).unwrap(),
                 headers: HashMap::new(),
                 body: String::new(),
             };
@@ -726,50 +1162,89 @@ mod tests {
         }
     }
 
-    // ── HttpError display / error trait ──────────────────────────────────────
+    // ── HttpError ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_invalid_url_error() {
-        let error = HttpError::InvalidUrl("not a valid url".to_string());
+        let error = HttpError::InvalidUrl {
+            msg: "not a valid url".to_string(),
+            source: None,
+        };
         assert!(error.to_string().contains("Invalid URL"));
     }
 
     #[test]
     fn test_http_error_display_all_variants() {
         assert!(
-            HttpError::InvalidUrl("x".to_string())
-                .to_string()
-                .contains("Invalid URL")
+            (HttpError::InvalidUrl {
+                msg: "x".to_string(),
+                source: None,
+            })
+            .to_string()
+            .contains("Invalid URL")
         );
         assert!(
-            HttpError::InvalidHeader("y".to_string())
-                .to_string()
-                .contains("Invalid header")
+            (HttpError::InvalidHeader {
+                msg: "y".to_string(),
+                source: None,
+            })
+            .to_string()
+            .contains("Invalid header")
         );
         assert!(
-            HttpError::RequestFailed("z".to_string())
-                .to_string()
-                .contains("Request failed")
+            (HttpError::RequestFailed {
+                msg: "z".to_string(),
+                source: None,
+            })
+            .to_string()
+            .contains("Request failed")
         );
         assert!(
-            HttpError::ResponseParseError("w".to_string())
-                .to_string()
-                .contains("Response parse error")
+            (HttpError::ResponseParseError {
+                msg: "w".to_string(),
+                source: None,
+            })
+            .to_string()
+            .contains("Response parse error")
         );
     }
 
     #[test]
     fn test_http_error_display_includes_message() {
         let msg = "something went wrong";
-        let err = HttpError::RequestFailed(msg.to_string());
+        let err = HttpError::RequestFailed {
+            msg: msg.to_string(),
+            source: None,
+        };
         assert!(err.to_string().contains(msg));
     }
 
     #[test]
     fn test_http_error_implements_std_error() {
-        // Verify that HttpError can be used as Box<dyn std::error::Error>
-        let err: Box<dyn std::error::Error> = Box::new(HttpError::InvalidUrl("bad".to_string()));
+        let err: Box<dyn std::error::Error> = Box::new(HttpError::InvalidUrl {
+            msg: "bad".to_string(),
+            source: None,
+        });
         assert!(err.to_string().contains("Invalid URL"));
+    }
+
+    #[test]
+    fn test_http_error_source_none() {
+        let err = HttpError::InvalidUrl {
+            msg: "bad".to_string(),
+            source: None,
+        };
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_http_error_source_some() {
+        let inner = "inner error".to_string();
+        let err = HttpError::InvalidUrl {
+            msg: "bad".to_string(),
+            source: Some(Box::new(ErrorSource(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, inner))))),
+        };
+        assert!(err.source().is_some());
     }
 
     // ── RequestEvent display ──────────────────────────────────────────────────
@@ -831,7 +1306,10 @@ mod tests {
 
     #[test]
     fn test_request_event_display_completed() {
-        assert_eq!(RequestEvent::Completed(25).to_string(), "Request completed: 25 total bytes");
+        assert_eq!(
+            RequestEvent::Completed(25).to_string(),
+            "Request completed: 25 total bytes"
+        );
     }
 
     #[test]

@@ -9,17 +9,21 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode};
+use crate::app::{App, CurrentScreen, EditingField, FocusableField, HeaderField, ResponseViewMode};
 use crate::keymap::{Action, KeyContext};
 
 // ── Small style helpers ───────────────────────────────────────────────────────
 
-/// Returns a cyan border style when `focused`, otherwise the default.
-fn focused_border_style(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusState {
+    Focused,
+    Unfocused,
+}
+
+fn focused_border_style(state: FocusState) -> Style {
+    match state {
+        FocusState::Focused => Style::default().fg(Color::Cyan),
+        FocusState::Unfocused => Style::default(),
     }
 }
 
@@ -78,11 +82,17 @@ fn wrapped_cursor_column(text: &str, max_width: u16) -> u16 {
 
 // ── Layout / rendering helpers ────────────────────────────────────────────────
 
+/// Controls how `render_scrollable_paragraph` adjusts the scroll offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollMode {
+    /// Set scroll to the last visible line (auto-follow new content).
+    End,
+    /// Clamp scroll so it never exceeds the last visible line.
+    Clamp,
+}
+
 /// Renders a scrollable, word-wrapped `Paragraph` with an optional vertical
-/// scrollbar.  If `auto_scroll_end` is true the scroll position is set to the
-/// last visible line (useful for live-updating windows where new data should
-/// be revealed as it arrives). Otherwise clamps `scroll` so it never exceeds
-/// the last visible line.
+/// scrollbar.
 fn render_scrollable_paragraph(
     frame: &mut Frame,
     text: String,
@@ -90,23 +100,20 @@ fn render_scrollable_paragraph(
     style: Style,
     area: Rect,
     scroll: &mut u16,
-    auto_scroll_end: bool,
+    mode: ScrollMode,
 ) {
     let inner = block.inner(area);
     let visible_lines = inner.height;
 
-    // Use a block-less paragraph for line counting so that line_count()
-    // returns the pure text row count using the inner (content) width.
     let line_count = Paragraph::new(text.as_str())
         .style(style)
         .wrap(Wrap { trim: false })
         .line_count(inner.width) as u16;
 
     let max_scroll = line_count.saturating_sub(visible_lines);
-    if auto_scroll_end {
-        *scroll = max_scroll;
-    } else {
-        *scroll = (*scroll).min(max_scroll);
+    match mode {
+        ScrollMode::End => *scroll = max_scroll,
+        ScrollMode::Clamp => *scroll = (*scroll).min(max_scroll),
     }
 
     let paragraph = Paragraph::new(text)
@@ -361,7 +368,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     let method_url_block = Block::default()
         .borders(Borders::ALL)
         .title(url_title)
-        .border_style(focused_border_style(is_url_focused));
+        .border_style(focused_border_style(if is_url_focused { FocusState::Focused } else { FocusState::Unfocused }));
 
     if is_url_editing {
         let inner = method_url_block.inner(left_chunks[0]);
@@ -398,7 +405,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         for (key, value) in &request.headers {
             lines.push(format!("{}: {}", key, value));
         }
-        if app.editing_header_key {
+        if app.header_field == HeaderField::Key {
             lines.push(format!("Key: {} [EDITING]", app.header_key_buffer));
         } else {
             lines.push(format!("Key: {}", app.header_key_buffer));
@@ -430,7 +437,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             .scroll((scroll, 0));
         frame.render_widget(headers_paragraph, left_chunks[1]);
         // Place cursor at the editing line
-        let cursor_col = if app.editing_header_key {
+        let cursor_col = if app.header_field == HeaderField::Key {
             "Key: ".len() + app.header_key_cursor
         } else {
             "Value: ".len() + app.header_value_cursor
@@ -451,7 +458,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_stateful_widget(scrollbar, left_chunks[1], &mut scrollbar_state);
         }
 
-        if app.editing_header_key {
+        if app.header_field == HeaderField::Key {
             let suggestions = app.get_filtered_header_suggestions();
             if !suggestions.is_empty() {
                 let area = Rect {
@@ -486,7 +493,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         let headers_block = Block::default()
             .borders(Borders::ALL)
             .title(headers_title)
-            .border_style(focused_border_style(is_headers_focused));
+            .border_style(focused_border_style(if is_headers_focused { FocusState::Focused } else { FocusState::Unfocused }));
 
         frame.render_widget(List::new(header_items).block(headers_block), left_chunks[1]);
     }
@@ -515,7 +522,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     let body_block = Block::default()
         .borders(Borders::ALL)
         .title(body_title)
-        .border_style(focused_border_style(is_body_focused));
+        .border_style(focused_border_style(if is_body_focused { FocusState::Focused } else { FocusState::Unfocused }));
 
     let body_prefix = if is_body_editing {
         Some(body_text[..app.cursor_pos].to_string())
@@ -530,7 +537,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         body_style,
         left_chunks[2],
         &mut app.body_scroll,
-        is_body_editing,
+        if is_body_editing { ScrollMode::End } else { ScrollMode::Clamp },
     );
 
     if let Some(ref body_prefix) = body_prefix {
@@ -582,7 +589,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
     let events_block = Block::default()
         .borders(Borders::ALL)
         .title("Request Events")
-        .border_style(focused_border_style(is_events_focused));
+        .border_style(focused_border_style(if is_events_focused { FocusState::Focused } else { FocusState::Unfocused }));
 
     render_scrollable_paragraph(
         frame,
@@ -591,7 +598,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         events_style,
         right_chunks[1],
         &mut app.events_scroll,
-        is_request_pending,
+        if is_request_pending { ScrollMode::End } else { ScrollMode::Clamp },
     );
 
     // ── Response ──────────────────────────────────────────────────────────────
@@ -631,7 +638,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
                     Color::Red
                 };
                 Span::styled(
-                    format!("{} {}", resp.status, resp.status_text),
+                    format!("{} {}", resp.status_code.as_u16(), resp.status_code.canonical_reason().unwrap_or("Unknown")),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 )
             }
@@ -662,7 +669,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             .centered(),
         )
         .title_top(Line::from(status_span).right_aligned())
-        .border_style(focused_border_style(is_response_focused));
+        .border_style(focused_border_style(if is_response_focused { FocusState::Focused } else { FocusState::Unfocused }));
 
     if is_json_mode && app.current_last_response().is_some() && !app.current_request_is_pending() {
         // Split the response area: body on top, filter bar at the bottom
@@ -980,9 +987,9 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             response_block,
             response_style,
             right_chunks[0],
-            &mut app.response_scroll,
-            false,
-        );
+        &mut app.response_scroll,
+        ScrollMode::Clamp,
+    );
     }
 
     // ── Autocomplete (rendered last so it floats above everything) ────────────
@@ -992,7 +999,7 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             .iter()
             .enumerate()
             .map(|(idx, suggestion)| {
-                let style = if idx == app.header_autocomplete_selected {
+                let style = if app.header_autocomplete.as_ref().map_or(false, |ac| idx == ac.selected) {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
@@ -1252,13 +1259,13 @@ mod tests {
 
     #[test]
     fn test_focused_border_style_when_focused_is_cyan() {
-        let style = focused_border_style(true);
+        let style = focused_border_style(FocusState::Focused);
         assert_eq!(style.fg, Some(Color::Cyan));
     }
 
     #[test]
     fn test_focused_border_style_when_not_focused_is_default() {
-        let style = focused_border_style(false);
+        let style = focused_border_style(FocusState::Unfocused);
         // Default style has no foreground colour set
         assert_eq!(style.fg, None);
     }

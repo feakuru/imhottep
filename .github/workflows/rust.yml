@@ -20,3 +20,17 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-tarpaulin
+      run: cargo install cargo-tarpaulin --locked
+    - name: Generate coverage report
+      run: cargo tarpaulin --out lcov --output-dir coverage
+    - name: Upload to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        files: coverage/lcov.info
+        fail_ci_if_error: false
