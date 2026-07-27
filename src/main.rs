@@ -14,6 +14,7 @@ mod app;
 mod keymap;
 pub mod http_client;
 mod ui;
+pub mod uv_client;
 use crate::{
     app::{App, CurrentScreen, EditingField, FocusableField, ResponseViewMode},
     keymap::{Action, Action::EditStreamPrefixRegex, Action::EditStreamSuffixRegex},
