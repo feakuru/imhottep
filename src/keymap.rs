@@ -428,7 +428,10 @@ impl Keymap {
                     description: "next field",
                 },
                 Binding {
-                    triggers: vec![KeyTrigger::Code(KeyCode::BackTab)],
+                    triggers: vec![
+                        KeyTrigger::Code(KeyCode::BackTab),
+                        KeyTrigger::Modified(KeyModifiers::SHIFT, KeyCode::BackTab),
+                    ],
                     action: Action::FocusPreviousField,
                     hint: "⇧tab",
                     description: "prev field",
@@ -1097,6 +1100,7 @@ impl Keymap {
                     triggers: vec![
                         KeyTrigger::Code(KeyCode::Tab),
                         KeyTrigger::Code(KeyCode::BackTab),
+                        KeyTrigger::Modified(KeyModifiers::SHIFT, KeyCode::BackTab),
                     ],
                     action: Action::ToggleHeaderKeyValue,
                     hint: "tab/⇧tab",
@@ -1407,6 +1411,22 @@ mod tests {
         let ctx = nav_ctx(CurrentScreen::Request, FocusableField::Url);
         assert_eq!(
             km.resolve(&ctx, &key(KeyCode::BackTab)),
+            Some(Action::FocusPreviousField)
+        );
+    }
+
+    #[test]
+    fn request_shift_backtab_focuses_previous() {
+        let km = Keymap::default();
+        let ctx = nav_ctx(CurrentScreen::Request, FocusableField::Url);
+        let event = KeyEvent {
+            code: KeyCode::BackTab,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(
+            km.resolve(&ctx, &event),
             Some(Action::FocusPreviousField)
         );
     }
