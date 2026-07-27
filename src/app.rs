@@ -1,6 +1,4 @@
-use crate::http_client::{
-    HttpError, HttpRequest, HttpResponse, HttpRuntime, RequestEvent,
-};
+use crate::http_client::{HttpError, HttpRequest, HttpResponse, HttpRuntime, RequestEvent};
 use crate::keymap::{KeyContext, Keymap};
 use hyper::Method;
 use std::collections::HashMap;
@@ -80,7 +78,7 @@ pub fn word_boundary_after(s: &str, cursor: usize) -> usize {
 
 /// Free-function version of strip_line that doesn't borrow self.
 /// Takes optional prefix/suffix regex patterns to use for stripping.
-fn strip_line_impl(
+fn strip_line(
     raw: &str,
     prefix_re: &Option<crate::http_client::RegexPattern>,
     suffix_re: &Option<crate::http_client::RegexPattern>,
@@ -228,8 +226,7 @@ pub struct App {
     pub current_screen: CurrentScreen,
     pub requests: Vec<HttpRequest>,
     pub current_request_index: Option<usize>,
-    pub pending_response:
-        Option<oneshot::Receiver<Result<HttpResponse, HttpError>>>,
+    pub pending_response: Option<oneshot::Receiver<Result<HttpResponse, HttpError>>>,
     pub pending_request_index: Option<usize>,
     pub event_receiver: Option<mpsc::UnboundedReceiver<RequestEvent>>,
     pub per_request: HashMap<usize, PerRequestState>,
@@ -417,7 +414,10 @@ impl App {
             match receiver.try_recv() {
                 Ok(result) => {
                     if let Some(idx) = self.pending_request_index {
-                        let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+                        let state = self
+                            .per_request
+                            .entry(idx)
+                            .or_insert_with(PerRequestState::new);
                         match result {
                             Ok(resp) => {
                                 state.streamed_body = resp.body.clone();
@@ -458,7 +458,10 @@ impl App {
                 match rx.try_recv() {
                     Ok(event) => {
                         if let Some(idx) = self.current_request_index {
-                            let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+                            let state = self
+                                .per_request
+                                .entry(idx)
+                                .or_insert_with(PerRequestState::new);
                             match event {
                                 JqEvent::Output(line) => {
                                     state.jq_output.push(line);
@@ -510,7 +513,10 @@ impl App {
         let idx_opt = self.pending_request_index;
         for event in collected_events {
             if let Some(idx) = idx_opt {
-                let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+                let state = self
+                    .per_request
+                    .entry(idx)
+                    .or_insert_with(PerRequestState::new);
                 match event {
                     crate::http_client::RequestEvent::BodyChunk(s) => {
                         state.streamed_body.push_str(&s);
@@ -685,12 +691,17 @@ impl App {
         if !write_ok {
             if let Some(rx) = &mut self.streamed_jq_output_rx {
                 while let Ok(event) = rx.try_recv() {
-                    let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+                    let state = self
+                        .per_request
+                        .entry(idx)
+                        .or_insert_with(PerRequestState::new);
                     match event {
                         JqEvent::Output(line) => state.jq_output.push(line),
                         JqEvent::Error(err) => {
                             let original = state.last_fed.clone();
-                            state.jq_output.push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
+                            state
+                                .jq_output
+                                .push(format!("{original} \x1b[31m// jq: {err}\x1b[0m"));
                         }
                     }
                 }
@@ -702,8 +713,7 @@ impl App {
                 }
             }
         }
-        self
-            .per_request
+        self.per_request
             .entry(idx)
             .or_insert_with(PerRequestState::new)
             .last_fed = stripped.to_string();
@@ -769,7 +779,10 @@ impl App {
     }
 
     fn process_chunk(&mut self, idx: usize, chunk: String) {
-        let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+        let state = self
+            .per_request
+            .entry(idx)
+            .or_insert_with(PerRequestState::new);
         state.line_buffer.push_str(&chunk);
 
         let combined = std::mem::take(&mut state.line_buffer);
@@ -792,7 +805,7 @@ impl App {
             .get_current_request()
             .map(|r| r.stream_suffix_regex.clone());
 
-        let strip_result = strip_line_impl(trimmed, &prefix_re, &suffix_re);
+        let strip_result = strip_line(trimmed, &prefix_re, &suffix_re);
         match strip_result {
             Err(e) => {
                 let msg = format!("\x1b[31m// {e}\x1b[0m");
@@ -850,7 +863,10 @@ impl App {
 
         self.kill_streamed_jq();
 
-        let state = self.per_request.entry(idx).or_insert_with(PerRequestState::new);
+        let state = self
+            .per_request
+            .entry(idx)
+            .or_insert_with(PerRequestState::new);
         state.jq_output.clear();
         state.last_fed.clear();
 
@@ -862,7 +878,7 @@ impl App {
         let mut stripped_lines: Vec<String> = Vec::new();
         for raw in &raw_lines {
             let trimmed = raw.trim_end_matches('\r');
-            match strip_line_impl(trimmed, &prefix_re, &suffix_re) {
+            match strip_line(trimmed, &prefix_re, &suffix_re) {
                 Err(e) => {
                     state.jq_output.push(format!("\x1b[31m// {e}\x1b[0m"));
                 }
@@ -1162,10 +1178,7 @@ impl App {
     }
 
     pub fn apply_autocomplete_selection(&mut self, suggestions: &[&str]) {
-        let selected = self
-            .header_autocomplete
-            .as_ref()
-            .map(|ac| ac.selected);
+        let selected = self.header_autocomplete.as_ref().map(|ac| ac.selected);
         if let Some(sel) = selected {
             if let Some(selected_name) = suggestions.get(sel) {
                 self.header_key_buffer = selected_name.to_string();
@@ -1330,7 +1343,7 @@ fn fuzzy_match(query: &str, target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http_client::{HttpMethod, HttpRequest, HttpResponse};
+    use crate::http_client::{HttpMethod, HttpRequest, HttpResponse, RegexPattern};
     use std::collections::HashMap;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1521,7 +1534,10 @@ mod tests {
             make_get("https://second.com"),
         ]);
         // index 0 is selected by default in app_with_requests
-        assert_eq!(&*app.get_current_request().unwrap().url, "https://first.com");
+        assert_eq!(
+            &*app.get_current_request().unwrap().url,
+            "https://first.com"
+        );
     }
 
     // ── Method cycling ────────────────────────────────────────────────────────
@@ -1899,14 +1915,20 @@ mod tests {
     #[test]
     fn test_is_response_json_true_for_json_body() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, r#"{"key":"value"}"#)));
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, r#"{"key":"value"}"#)));
         assert!(app.is_response_json());
     }
 
     #[test]
     fn test_is_response_json_false_for_plain_text() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, "plain text response")));
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, "plain text response")));
         assert!(!app.is_response_json());
     }
 
@@ -1919,14 +1941,23 @@ mod tests {
     #[test]
     fn test_is_response_json_false_on_error_response() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Err(HttpError::RequestFailed { msg: "request failed".to_string(), source: None }));
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Err(HttpError::RequestFailed {
+            msg: "request failed".to_string(),
+            source: None,
+        }));
         assert!(!app.is_response_json());
     }
 
     #[test]
     fn test_cycle_response_view_mode_text_to_json_when_json_available() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
         app.response_view_mode = ResponseViewMode::Text;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Json);
@@ -1935,7 +1966,10 @@ mod tests {
     #[test]
     fn test_cycle_response_view_mode_stays_text_when_not_json() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, "not json")));
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, "not json")));
         app.response_view_mode = ResponseViewMode::Text;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Text);
@@ -1944,7 +1978,10 @@ mod tests {
     #[test]
     fn test_cycle_response_view_mode_json_to_text() {
         let mut app = app_with_requests(vec![make_get("https://a.com")]);
-        app.per_request.entry(0).or_insert_with(PerRequestState::new).last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
         app.response_view_mode = ResponseViewMode::Json;
         app.cycle_response_view_mode();
         assert_eq!(app.response_view_mode, ResponseViewMode::Text);
@@ -2137,5 +2174,443 @@ mod tests {
         app.header_key_buffer = "xyz_not_a_header_xyz".to_string();
         let suggestions = app.get_filtered_header_suggestions();
         assert!(suggestions.is_empty());
+    }
+
+    // ── fuzzy_match (direct) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_fuzzy_match_exact_match() {
+        assert!(fuzzy_match("content-type", "content-type"));
+    }
+
+    #[test]
+    fn test_fuzzy_match_subsequence() {
+        assert!(fuzzy_match("ct", "content-type"));
+    }
+
+    #[test]
+    fn test_fuzzy_match_case_sensitive() {
+        // fuzzy_match is case-sensitive by design
+        assert!(!fuzzy_match("CONTENT", "content-type"));
+    }
+
+    #[test]
+    fn test_fuzzy_match_no_match() {
+        assert!(!fuzzy_match("xyz", "content-type"));
+    }
+
+    #[test]
+    fn test_fuzzy_match_empty_query_matches_anything() {
+        assert!(fuzzy_match("", "anything"));
+    }
+
+    // ── word_boundary_before ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_word_boundary_before_from_zero() {
+        assert_eq!(word_boundary_before("hello world", 0), 0);
+    }
+
+    #[test]
+    fn test_word_boundary_before_jumps_to_word_start() {
+        // "hello world" — cursor at 6 (space), before should be at 0 ("hello" start)
+        assert_eq!(word_boundary_before("hello world", 6), 0);
+    }
+
+    #[test]
+    fn test_word_boundary_before_in_middle_of_word() {
+        // cursor at 3 ("l" in "hello") — before should be at 0
+        assert_eq!(word_boundary_before("hello world", 3), 0);
+    }
+
+    #[test]
+    fn test_word_boundary_before_non_alnum() {
+        // "abc://def" — cursor at 6 ("/" in "://"), before should skip "://" to 3 ("abc" end)
+        assert_eq!(word_boundary_before("abc://def", 6), 3);
+    }
+
+    #[test]
+    fn test_word_boundary_before_skip_leading_whitespace() {
+        // "  hello" — cursor at 6 (after "hello"), should skip whitespace to "hello" start at 2
+        assert_eq!(word_boundary_before("  hello", 6), 2);
+    }
+
+    #[test]
+    fn test_word_boundary_before_already_at_start_of_word() {
+        // cursor at 6, right at "world" start
+        assert_eq!(word_boundary_before("hello world", 6), 0);
+    }
+
+    // ── word_boundary_after ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_word_boundary_after_from_end() {
+        assert_eq!(word_boundary_after("hello world", 11), 11);
+    }
+
+    #[test]
+    fn test_word_boundary_after_jumps_to_next_word() {
+        // cursor at 0 ("h" in "hello") — after should be at 5 (end of "hello")
+        assert_eq!(word_boundary_after("hello world", 0), 5);
+    }
+
+    #[test]
+    fn test_word_boundary_after_in_middle_of_word() {
+        // cursor at 2 ("l" in "hello") — after should be at 5
+        assert_eq!(word_boundary_after("hello world", 2), 5);
+    }
+
+    #[test]
+    fn test_word_boundary_after_non_alnum() {
+        // "abc://def" — cursor at 3 ('c'), after should jump to index 6 (start of "def")
+        assert_eq!(word_boundary_after("abc://def", 3), 6);
+    }
+
+    #[test]
+    fn test_word_boundary_after_skip_whitespace() {
+        // cursor at 5 (space), after should skip to "world" end at 11
+        assert_eq!(word_boundary_after("hello world", 5), 11);
+    }
+
+    // ── strip_line ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_line_with_prefix_suffix() {
+        let prefix = RegexPattern::new(r"^\w+:\s*".to_string());
+        let suffix = RegexPattern::new(r"\s*$".to_string());
+        let result = strip_line("data: {\"key\": \"value\"}  ", &Some(prefix), &Some(suffix));
+        assert_eq!(result.unwrap(), r#"{"key": "value"}"#);
+    }
+
+    #[test]
+    fn test_strip_line_prefix_only() {
+        let prefix = RegexPattern::new(r"^event:\s*".to_string());
+        let suffix = RegexPattern::new(r"^$".to_string());
+        let result = strip_line("event: update", &Some(prefix), &Some(suffix));
+        assert_eq!(result.unwrap(), "update");
+    }
+
+    #[test]
+    fn test_strip_line_no_change() {
+        let prefix = RegexPattern::new(r"^$".to_string());
+        let suffix = RegexPattern::new(r"^$".to_string());
+        let result = strip_line("plain line", &Some(prefix), &Some(suffix));
+        assert_eq!(result.unwrap(), "plain line");
+    }
+
+    #[test]
+    fn test_strip_line_no_regex_available_with_some() {
+        let prefix = RegexPattern::new(r"[invalid".to_string());
+        let noop_suffix = RegexPattern::new(r"^$".to_string());
+        let result = strip_line("test", &Some(prefix), &Some(noop_suffix));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid prefix regex"));
+    }
+
+    // ── current_request_is_pending ───────────────────────────────────────────
+
+    #[test]
+    fn test_current_request_is_pending_true() {
+        use tokio::sync::oneshot;
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        let (_tx, rx) = oneshot::channel::<Result<HttpResponse, crate::http_client::HttpError>>();
+        app.pending_response = Some(rx);
+        app.pending_request_index = Some(0);
+        assert!(app.current_request_is_pending());
+    }
+
+    #[test]
+    fn test_current_request_is_pending_false_no_request() {
+        let app = app_with_requests(vec![]);
+        assert!(!app.current_request_is_pending());
+    }
+
+    #[test]
+    fn test_current_request_is_pending_false_no_pending() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        assert!(!app.current_request_is_pending());
+    }
+
+    #[test]
+    fn test_current_request_is_pending_false_mismatched_index() {
+        use tokio::sync::oneshot;
+        let mut app = app_with_requests(vec![make_get("https://a.com"), make_get("https://b.com")]);
+        let (_tx, rx) = oneshot::channel::<Result<HttpResponse, crate::http_client::HttpError>>();
+        app.pending_response = Some(rx);
+        app.pending_request_index = Some(1); // different from current (0)
+        assert!(!app.current_request_is_pending());
+    }
+
+    // ── Accessors: current_jq_filter, stream_prefix/suffix, streamed_body ────
+
+    #[test]
+    fn test_current_jq_filter_default() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        assert_eq!(app.current_jq_filter(), ".");
+    }
+
+    #[test]
+    fn test_current_jq_filter_custom() {
+        let mut req = make_get("https://a.com");
+        req.jq_filter = crate::http_client::JqFilter::from(".key");
+        let app = app_with_requests(vec![req]);
+        assert_eq!(app.current_jq_filter(), ".key");
+    }
+
+    #[test]
+    fn test_current_jq_filter_no_request() {
+        let app = app_with_requests(vec![]);
+        assert_eq!(app.current_jq_filter(), ".");
+    }
+
+    #[test]
+    fn test_current_stream_prefix_regex_default() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        assert_eq!(app.current_stream_prefix_regex(), r"^\w+:\s*");
+    }
+
+    #[test]
+    fn test_current_stream_prefix_regex_no_request() {
+        let app = app_with_requests(vec![]);
+        assert_eq!(app.current_stream_prefix_regex(), r"^\w+:\s*");
+    }
+
+    #[test]
+    fn test_current_stream_suffix_regex_default() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        assert_eq!(app.current_stream_suffix_regex(), r"\s*$");
+    }
+
+    #[test]
+    fn test_current_stream_suffix_regex_no_request() {
+        let app = app_with_requests(vec![]);
+        assert_eq!(app.current_stream_suffix_regex(), r"\s*$");
+    }
+
+    #[test]
+    fn test_current_streamed_body_returns_body() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .streamed_body = "response body".to_string();
+        assert_eq!(app.current_streamed_body(), "response body");
+    }
+
+    #[test]
+    fn test_current_streamed_body_no_request() {
+        let app = app_with_requests(vec![]);
+        assert_eq!(app.current_streamed_body(), "");
+    }
+
+    #[test]
+    fn test_current_streamed_body_no_state() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        assert_eq!(app.current_streamed_body(), "");
+    }
+
+    // ── focused_scroll (tested via scroll_up/scroll_down per field) ──────────
+
+    #[test]
+    fn test_scroll_headers_independence() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.focused_field = FocusableField::Headers;
+        app.scroll_down(5);
+        assert_eq!(app.headers_scroll, 5);
+        app.scroll_up(2);
+        assert_eq!(app.headers_scroll, 3);
+    }
+
+    #[test]
+    fn test_scroll_events_independence() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.focused_field = FocusableField::RequestEvents;
+        app.scroll_down(7);
+        assert_eq!(app.events_scroll, 7);
+        app.scroll_up(3);
+        assert_eq!(app.events_scroll, 4);
+    }
+
+    // ── key_context ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_key_context_main_screen() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        let ctx = app.key_context();
+        assert_eq!(ctx.screen, CurrentScreen::Main);
+        assert_eq!(ctx.editing, None);
+        assert_eq!(ctx.focus, FocusableField::Url);
+    }
+
+    #[test]
+    fn test_key_context_request_screen_editing_url() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.current_screen = CurrentScreen::Request;
+        app.editing_field = Some(EditingField::Url);
+        let ctx = app.key_context();
+        assert_eq!(ctx.screen, CurrentScreen::Request);
+        assert_eq!(ctx.editing, Some(EditingField::Url));
+    }
+
+    // ── edit_selected_header ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_edit_selected_header_populates_buffers() {
+        let req = HttpRequest::new(HttpMethod::GET, "https://a.com")
+            .with_header("Content-Type", "application/json");
+        let mut app = app_with_requests(vec![req]);
+        app.selected_header_index = 0;
+        app.edit_selected_header();
+        assert_eq!(app.editing_field, Some(EditingField::Headers));
+        assert_eq!(app.header_key_buffer, "Content-Type");
+        assert_eq!(app.header_value_buffer, "application/json");
+        assert_eq!(app.header_field, HeaderField::Key);
+        assert!(app.header_autocomplete.is_some());
+    }
+
+    #[test]
+    fn test_edit_selected_header_no_headers_is_noop() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.selected_header_index = 0;
+        app.edit_selected_header();
+        assert_eq!(app.editing_field, None);
+    }
+
+    #[test]
+    fn test_edit_selected_header_out_of_bounds_is_noop() {
+        let req = HttpRequest::new(HttpMethod::GET, "https://a.com").with_header("X-One", "1");
+        let mut app = app_with_requests(vec![req]);
+        app.selected_header_index = 5; // out of bounds
+        app.edit_selected_header();
+        assert_eq!(app.editing_field, None);
+    }
+
+    // ── cycle_response_view_mode with StreamedJson ───────────────────────────
+
+    #[test]
+    fn test_cycle_to_streamed_json() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, "plain text")));
+        app.streamed_jq_available = true;
+        app.response_view_mode = ResponseViewMode::Text;
+        // Text -> StreamedJson (not json but streamed available)
+        app.cycle_response_view_mode();
+        assert_eq!(app.response_view_mode, ResponseViewMode::StreamedJson);
+    }
+
+    #[test]
+    fn test_cycle_from_json_to_streamed() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new)
+            .last_response = Some(Ok(make_response(200, r#"{"ok":true}"#)));
+        app.streamed_jq_available = true;
+        app.response_view_mode = ResponseViewMode::Json;
+        // Json -> StreamedJson
+        app.cycle_response_view_mode();
+        assert_eq!(app.response_view_mode, ResponseViewMode::StreamedJson);
+    }
+
+    #[test]
+    fn test_cycle_from_streamed_to_text() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.response_view_mode = ResponseViewMode::StreamedJson;
+        app.cycle_response_view_mode();
+        assert_eq!(app.response_view_mode, ResponseViewMode::Text);
+    }
+
+    // ── Autocomplete with None ───────────────────────────────────────────────
+
+    #[test]
+    fn test_select_next_autocomplete_when_none_is_noop() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.header_autocomplete = None;
+        app.select_next_autocomplete(5);
+        assert!(app.header_autocomplete.is_none());
+    }
+
+    #[test]
+    fn test_select_previous_autocomplete_when_none_is_noop() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        app.header_autocomplete = None;
+        app.select_previous_autocomplete();
+        assert!(app.header_autocomplete.is_none());
+    }
+
+    // ── save_requests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_save_requests_sets_success_status() {
+        use tempfile::TempDir;
+
+        let app = app_with_requests(vec![make_get("https://save-status.com")]);
+        let dir = TempDir::new().expect("tempdir");
+        // Override the save target via save_requests_to_dir
+        let result = crate::app::save_requests_to_dir(&app.requests, Some(dir.path()));
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_save_requests_empty_creates_file() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let result = crate::app::save_requests_to_dir(&[], Some(dir.path()));
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.exists());
+        // Verify content is an empty array
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim(), "[]");
+    }
+
+    // ── current_streamed_jq_output ───────────────────────────────────────────
+
+    #[test]
+    fn test_current_streamed_jq_output_empty() {
+        let app = app_with_requests(vec![make_get("https://a.com")]);
+        assert_eq!(app.current_streamed_jq_output(), "");
+    }
+
+    #[test]
+    fn test_current_streamed_jq_output_joins_lines() {
+        let mut app = app_with_requests(vec![make_get("https://a.com")]);
+        let state = app
+            .per_request
+            .entry(0)
+            .or_insert_with(PerRequestState::new);
+        state.jq_output.push("line1".to_string());
+        state.jq_output.push("line2".to_string());
+        assert_eq!(app.current_streamed_jq_output(), "line1\nline2");
+    }
+
+    #[test]
+    fn test_current_streamed_jq_output_no_request() {
+        let app = app_with_requests(vec![]);
+        assert_eq!(app.current_streamed_jq_output(), "");
+    }
+
+    // ── JqProcess::drop (no panic) ───────────────────────────────────────────
+
+    #[test]
+    fn test_jq_process_drop_exited_child_does_not_panic() {
+        // Spawn a process that exits immediately, wrap in JqProcess, then drop
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn true");
+        let stdin = child.stdin.take().expect("stdin");
+        // Wait for the process to exit before dropping
+        // (drop should handle already-exited children gracefully)
+        let jq = JqProcess { stdin, child };
+        drop(jq); // must not panic
     }
 }

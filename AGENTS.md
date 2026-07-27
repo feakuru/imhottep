@@ -13,6 +13,14 @@ cargo run
 cargo test
 ```
 
+## Coverage
+
+```sh
+# Generate (requires cargo-tarpaulin)
+# tarpaulin.toml excludes main.rs and ui.rs (TUI entry & rendering — not unit-testable)
+cargo tarpaulin
+```
+
 ## Git usage
 
 You should never commit anything or change the git state in any other way unless the user explicitly asked you to. Otherwise, you may view Git history in any way you need to.

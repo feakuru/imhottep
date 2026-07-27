@@ -1,0 +1,6 @@
+[unit]
+exclude-files = ["src/main.rs", "src/ui.rs"]
+
+[report]
+out = ["Lcov"]
+output-dir = "coverage"

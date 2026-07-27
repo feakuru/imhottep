@@ -1318,4 +1318,261 @@ mod tests {
         assert!(ev.to_string().contains("Request failed"));
         assert!(ev.to_string().contains("timeout"));
     }
+
+    #[test]
+    fn test_request_event_display_body_chunk() {
+        let ev = RequestEvent::BodyChunk("data".to_string());
+        assert_eq!(ev.to_string(), "Body chunk (4 bytes)");
+    }
+
+    #[test]
+    fn test_request_event_display_temporary_problem() {
+        let ev = RequestEvent::TemporaryConnectionProblem("timeout".to_string());
+        assert!(ev.to_string().contains("Temporary issue"));
+        assert!(ev.to_string().contains("timeout"));
+    }
+
+    // ── HeaderValue display & borrow ─────────────────────────────────────────
+
+    #[test]
+    fn test_header_value_display() {
+        let v: HeaderValue = "text/html".into();
+        assert_eq!(v.to_string(), "text/html");
+    }
+
+    #[test]
+    fn test_header_value_borrow() {
+        let v: HeaderValue = "application/json".into();
+        let borrowed: &str = v.borrow();
+        assert_eq!(borrowed, "application/json");
+    }
+
+    // ── JqFilter additional impls ────────────────────────────────────────────
+
+    #[test]
+    fn test_jq_filter_display() {
+        let f = JqFilter::default();
+        assert_eq!(f.to_string(), ".");
+    }
+
+    #[test]
+    fn test_jq_filter_from_string() {
+        let f: JqFilter = ".key".to_string().into();
+        assert_eq!(&*f, ".key");
+    }
+
+    #[test]
+    fn test_jq_filter_from_str() {
+        let f: JqFilter = ".key".into();
+        assert_eq!(&*f, ".key");
+    }
+
+    // ── RegexPattern additional impls ─────────────────────────────────────────
+
+    #[test]
+    fn test_regex_pattern_display() {
+        let r = RegexPattern::new(r"^\w+:\s*".to_string());
+        assert_eq!(r.to_string(), r"^\w+:\s*");
+    }
+
+    #[test]
+    fn test_regex_pattern_deref() {
+        let r = RegexPattern::new(r"\d+".to_string());
+        assert_eq!(&*r, r"\d+");
+    }
+
+    #[test]
+    fn test_regex_pattern_partial_eq() {
+        let a = RegexPattern::new(r"^data:".to_string());
+        let b = RegexPattern::new(r"^data:".to_string());
+        let c = RegexPattern::new(r"^event:".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_regex_pattern_from_string() {
+        let r: RegexPattern = r"^\w+:\s*".to_string().into();
+        assert_eq!(r.pattern(), r"^\w+:\s*");
+        assert!(r.compiled().is_some());
+    }
+
+    #[test]
+    fn test_regex_pattern_from_str() {
+        let r: RegexPattern = r"\d+".into();
+        assert_eq!(r.pattern(), r"\d+");
+        assert!(r.compiled().is_some());
+    }
+
+    // ── send_event helper ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_send_event_with_sender() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_event(&Some(tx), RequestEvent::Started);
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert!(matches!(received.unwrap(), RequestEvent::Started));
+    }
+
+    #[test]
+    fn test_send_event_with_none() {
+        // Must not panic when tx is None
+        send_event(&None, RequestEvent::Started);
+    }
+
+    #[test]
+    fn test_send_event_with_closed_channel() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        // Must not panic when channel is closed
+        send_event(&Some(tx), RequestEvent::Started);
+    }
+
+    // ── fail helper ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fail_creates_error_and_sends_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let err = fail(
+            &Some(tx),
+            "bad url".to_string(),
+            None,
+            |msg, source| HttpError::InvalidUrl { msg, source },
+        );
+        assert!(matches!(err, HttpError::InvalidUrl { .. }));
+        assert!(err.to_string().contains("bad url"));
+
+        // Should have sent a Failed event
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        assert!(matches!(event.unwrap(), RequestEvent::Failed(_)));
+    }
+
+    #[test]
+    fn test_fail_with_source() {
+        let inner = std::io::Error::new(std::io::ErrorKind::Other, "inner error");
+        let err = fail(
+            &None,
+            "outer".to_string(),
+            Some(Box::new(inner)),
+            |msg, source| HttpError::RequestFailed { msg, source },
+        );
+        if let HttpError::RequestFailed { source, .. } = err {
+            assert!(source.is_some());
+        } else {
+            panic!("expected RequestFailed");
+        }
+    }
+
+    // ── Default impls & helpers ──────────────────────────────────────────────
+
+    #[test]
+    fn test_http_client_default() {
+        let client = HttpClient::default();
+        // just verify it doesn't panic
+        let _ = client;
+    }
+
+    #[test]
+    fn test_default_jq_filter_helper() {
+        let f = default_jq_filter();
+        assert_eq!(&*f, ".");
+        assert!(is_default_jq_filter(&f));
+    }
+
+    #[test]
+    fn test_is_default_jq_filter_false() {
+        let f: JqFilter = ".key".into();
+        assert!(!is_default_jq_filter(&f));
+    }
+
+    #[test]
+    fn test_default_prefix_regex_helper() {
+        let r = default_prefix_regex();
+        assert_eq!(r.pattern(), r"^\w+:\s*");
+        assert!(is_default_prefix_regex(&r));
+    }
+
+    #[test]
+    fn test_is_default_prefix_regex_false() {
+        let r = RegexPattern::new(r"^custom:".to_string());
+        assert!(!is_default_prefix_regex(&r));
+    }
+
+    #[test]
+    fn test_default_suffix_regex_helper() {
+        let r = default_suffix_regex();
+        assert_eq!(r.pattern(), r"\s*$");
+        assert!(is_default_suffix_regex(&r));
+    }
+
+    #[test]
+    fn test_is_default_suffix_regex_false() {
+        let r = RegexPattern::new(r"###".to_string());
+        assert!(!is_default_suffix_regex(&r));
+    }
+
+    // ── UrlString::into String ───────────────────────────────────────────────
+
+    #[test]
+    fn test_url_string_into_string() {
+        let u = UrlString::new("https://example.com".to_string());
+        let s: String = u.into();
+        assert_eq!(s, "https://example.com");
+    }
+
+    // ── JqFilter::new ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_jq_filter_new() {
+        let f = JqFilter::new("select(.key)".to_string());
+        assert_eq!(&*f, "select(.key)");
+    }
+
+    // ── ErrorSource impls ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_source_clone_preserves_message() {
+        let inner = std::io::Error::new(std::io::ErrorKind::Other, "original msg");
+        let source = ErrorSource(Box::new(inner));
+        let cloned = source.clone();
+        // clone is lossy — wraps to_string() in a new io::Error
+        assert!(cloned.to_string().contains("original msg"));
+    }
+
+    #[test]
+    fn test_error_source_source_returns_none_for_io_error() {
+        let inner = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let source = ErrorSource(Box::new(inner));
+        // A plain io::Error has no further source
+        assert!(source.source().is_none());
+    }
+
+    #[test]
+    fn test_error_source_display() {
+        let inner = std::io::Error::new(std::io::ErrorKind::Other, "display me");
+        let source = ErrorSource(Box::new(inner));
+        assert_eq!(source.to_string(), "display me");
+    }
+
+    // ── regex_pattern_serde (via non-default pattern on HttpRequest) ─────────
+
+    #[test]
+    fn test_regex_pattern_serde_custom_pattern_round_trip() {
+        let mut req = HttpRequest::new(HttpMethod::GET, "https://example.com");
+        req.stream_prefix_regex = RegexPattern::new(r"^custom:\s*".to_string());
+        req.stream_suffix_regex = RegexPattern::new(r"END$".to_string());
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r"^custom:\\s*"), "custom prefix should appear in JSON: {json}");
+        assert!(json.contains(r"END$"), "custom suffix should appear in JSON: {json}");
+
+        let decoded: HttpRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.stream_prefix_regex.pattern(), r"^custom:\s*");
+        assert_eq!(decoded.stream_suffix_regex.pattern(), r"END$");
+        // Ensure they're compiled after deserialization
+        assert!(decoded.stream_prefix_regex.compiled().is_some());
+        assert!(decoded.stream_suffix_regex.compiled().is_some());
+    }
 }
