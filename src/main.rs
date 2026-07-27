@@ -112,15 +112,30 @@ where
                             match editing {
                                 EditingField::Headers => {
                                     if app.editing_header_key {
-                                        app.header_key_buffer.push(c);
+                                        app.header_key_buffer.insert(app.header_key_cursor, c);
+                                        app.header_key_cursor += 1;
                                         app.header_autocomplete_selected = 0;
                                     } else {
-                                        app.header_value_buffer.push(c);
+                                        app.header_value_buffer.insert(app.header_value_cursor, c);
+                                        app.header_value_cursor += 1;
                                     }
+                                    app.headers_scroll = u16::MAX;
                                 }
-                                _ => {
-                                    // JsonFilter, StreamPrefixRegex, StreamSuffixRegex, Url, Body
-                                    app.input_buffer.push(c);
+                                EditingField::Url => {
+                                    app.input_buffer.insert(app.cursor_pos, c);
+                                    app.cursor_pos += 1;
+                                    app.url_h_scroll = u16::MAX;
+                                }
+                                EditingField::JsonFilter
+                                | EditingField::StreamPrefixRegex
+                                | EditingField::StreamSuffixRegex => {
+                                    app.input_buffer.insert(app.cursor_pos, c);
+                                    app.cursor_pos += 1;
+                                    app.filter_h_scroll = u16::MAX;
+                                }
+                                EditingField::Body => {
+                                    app.input_buffer.insert(app.cursor_pos, c);
+                                    app.cursor_pos += 1;
                                 }
                             }
                         }
@@ -250,6 +265,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                     || app.response_view_mode == ResponseViewMode::StreamedJson)
             {
                 app.input_buffer = app.current_jq_filter().to_string();
+                app.cursor_pos = app.input_buffer.len();
                 app.editing_field = Some(EditingField::JsonFilter);
             }
         }
@@ -258,6 +274,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 && app.response_view_mode == ResponseViewMode::StreamedJson
             {
                 app.input_buffer = app.current_stream_prefix_regex().to_string();
+                app.cursor_pos = app.input_buffer.len();
                 app.editing_field = Some(EditingField::StreamPrefixRegex);
             }
         }
@@ -266,6 +283,7 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 && app.response_view_mode == ResponseViewMode::StreamedJson
             {
                 app.input_buffer = app.current_stream_suffix_regex().to_string();
+                app.cursor_pos = app.input_buffer.len();
                 app.editing_field = Some(EditingField::StreamSuffixRegex);
             }
         }
@@ -274,8 +292,11 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
         Action::CancelEdit => {
             app.editing_field = None;
             app.input_buffer.clear();
+            app.cursor_pos = 0;
             app.header_key_buffer.clear();
+            app.header_key_cursor = 0;
             app.header_value_buffer.clear();
+            app.header_value_cursor = 0;
             app.editing_header_key = true;
             app.editing_existing_header = None;
             app.header_autocomplete_visible = false;
@@ -366,7 +387,8 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
             }
         }
         Action::InsertNewline => {
-            app.input_buffer.push('\n');
+            app.input_buffer.insert(app.cursor_pos, '\n');
+            app.cursor_pos += 1;
         }
         Action::SaveBody => {
             let body = app.input_buffer.clone();
@@ -381,15 +403,294 @@ fn execute_action(app: &mut App, action: Action) -> io::Result<bool> {
                 match editing {
                     EditingField::Headers => {
                         if app.editing_header_key {
-                            app.header_key_buffer.pop();
-                            app.header_autocomplete_selected = 0;
-                        } else {
-                            app.header_value_buffer.pop();
+                            if app.header_key_cursor > 0 {
+                                app.header_key_buffer.remove(app.header_key_cursor - 1);
+                                app.header_key_cursor -= 1;
+                                app.header_autocomplete_selected = 0;
+                            }
+                        } else if app.header_value_cursor > 0 {
+                            app.header_value_buffer.remove(app.header_value_cursor - 1);
+                            app.header_value_cursor -= 1;
+                        }
+                        app.headers_scroll = u16::MAX;
+                    }
+                    EditingField::Url
+                    | EditingField::JsonFilter
+                    | EditingField::StreamPrefixRegex
+                    | EditingField::StreamSuffixRegex
+                    | EditingField::Body => {
+                        if app.cursor_pos > 0 {
+                            app.input_buffer.remove(app.cursor_pos - 1);
+                            app.cursor_pos -= 1;
+                        }
+                        match editing {
+                            EditingField::Url => app.url_h_scroll = u16::MAX,
+                            EditingField::JsonFilter
+                            | EditingField::StreamPrefixRegex
+                            | EditingField::StreamSuffixRegex => {
+                                app.filter_h_scroll = u16::MAX;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Action::DeleteNextChar => {
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            if app.header_key_cursor < app.header_key_buffer.len() {
+                                app.header_key_buffer.remove(app.header_key_cursor);
+                            }
+                        } else if app.header_value_cursor < app.header_value_buffer.len() {
+                            app.header_value_buffer.remove(app.header_value_cursor);
                         }
                     }
                     _ => {
-                        app.input_buffer.pop();
+                        if app.cursor_pos < app.input_buffer.len() {
+                            app.input_buffer.remove(app.cursor_pos);
+                        }
                     }
+                }
+            }
+        }
+        Action::DeleteWordBackward => {
+            let delete_before = |buf: &mut String, cursor: &mut usize| {
+                if *cursor == 0 {
+                    return;
+                }
+                let before = &buf[..*cursor];
+                let mut end = before.len();
+                let chars: Vec<char> = before.chars().rev().collect();
+                let mut i = 0;
+                // Skip trailing whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                    end -= 1;
+                }
+                if i >= chars.len() {
+                    *cursor = 0;
+                    return;
+                }
+                let is_alnum = chars[i].is_alphanumeric();
+                while i < chars.len()
+                    && !chars[i].is_whitespace()
+                    && chars[i].is_alphanumeric() == is_alnum
+                {
+                    i += 1;
+                    end -= 1;
+                }
+                let keep_until = end;
+                buf.drain(keep_until..*cursor);
+                *cursor = keep_until;
+            };
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            delete_before(&mut app.header_key_buffer, &mut app.header_key_cursor);
+                        } else {
+                            delete_before(&mut app.header_value_buffer, &mut app.header_value_cursor);
+                        }
+                        app.headers_scroll = u16::MAX;
+                    }
+                    _ => {
+                        delete_before(&mut app.input_buffer, &mut app.cursor_pos);
+                    }
+                }
+            }
+        }
+        Action::DeleteWordForward => {
+            let delete_forward = |buf: &mut String, cursor: &mut usize| {
+                if *cursor >= buf.len() {
+                    return;
+                }
+                let after = &buf[*cursor..];
+                let chars: Vec<char> = after.chars().collect();
+                let mut i = 0;
+                // Skip leading whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return;
+                }
+                let is_alnum = chars[i].is_alphanumeric();
+                while i < chars.len()
+                    && !chars[i].is_whitespace()
+                    && chars[i].is_alphanumeric() == is_alnum
+                {
+                    i += 1;
+                }
+                buf.drain(*cursor..*cursor + i);
+            };
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            delete_forward(
+                                &mut app.header_key_buffer,
+                                &mut app.header_key_cursor,
+                            );
+                        } else {
+                            delete_forward(
+                                &mut app.header_value_buffer,
+                                &mut app.header_value_cursor,
+                            );
+                        }
+                        app.headers_scroll = u16::MAX;
+                    }
+                    _ => delete_forward(&mut app.input_buffer, &mut app.cursor_pos),
+                }
+            }
+        }
+        Action::CursorLeft => {
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key && app.header_key_cursor > 0 {
+                            app.header_key_cursor -= 1;
+                        } else if !app.editing_header_key && app.header_value_cursor > 0 {
+                            app.header_value_cursor -= 1;
+                        }
+                    }
+                    _ => {
+                        if app.cursor_pos > 0 {
+                            app.cursor_pos -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        Action::CursorRight => {
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key
+                            && app.header_key_cursor < app.header_key_buffer.len()
+                        {
+                            app.header_key_cursor += 1;
+                        } else if !app.editing_header_key
+                            && app.header_value_cursor < app.header_value_buffer.len()
+                        {
+                            app.header_value_cursor += 1;
+                        }
+                    }
+                    _ => {
+                        if app.cursor_pos < app.input_buffer.len() {
+                            app.cursor_pos += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Action::CursorWordLeft => {
+            let word_left = |buf: &str, cursor: &mut usize| {
+                if *cursor == 0 {
+                    return;
+                }
+                let before = &buf[..*cursor];
+                let mut end = before.len();
+                let chars: Vec<char> = before.chars().rev().collect();
+                let mut i = 0;
+                // Skip trailing whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                    end -= 1;
+                }
+                if i >= chars.len() {
+                    *cursor = 0;
+                    return;
+                }
+                // Determine the category of the first non-whitespace char
+                let is_alnum = chars[i].is_alphanumeric();
+                // Skip chars of the same category (alnum or non-alnum)
+                while i < chars.len() && !chars[i].is_whitespace() && chars[i].is_alphanumeric() == is_alnum
+                {
+                    i += 1;
+                    end -= 1;
+                }
+                *cursor = end;
+            };
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            word_left(&app.header_key_buffer, &mut app.header_key_cursor);
+                        } else {
+                            word_left(&app.header_value_buffer, &mut app.header_value_cursor);
+                        }
+                    }
+                    _ => word_left(&app.input_buffer, &mut app.cursor_pos),
+                }
+            }
+        }
+        Action::CursorWordRight => {
+            let word_right = |buf: &str, cursor: &mut usize| {
+                let bytes = buf.len();
+                if *cursor >= bytes {
+                    return;
+                }
+                let after = &buf[*cursor..];
+                let chars: Vec<char> = after.chars().collect();
+                let mut i = 0;
+                // Skip leading whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    *cursor = bytes;
+                    return;
+                }
+                // Determine the category
+                let is_alnum = chars[i].is_alphanumeric();
+                // Skip chars of the same category
+                while i < chars.len() && !chars[i].is_whitespace() && chars[i].is_alphanumeric() == is_alnum
+                {
+                    i += 1;
+                }
+                *cursor += i;
+            };
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            word_right(&app.header_key_buffer, &mut app.header_key_cursor);
+                        } else {
+                            word_right(&app.header_value_buffer, &mut app.header_value_cursor);
+                        }
+                    }
+                    _ => word_right(&app.input_buffer, &mut app.cursor_pos),
+                }
+            }
+        }
+        Action::CursorHome => {
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            app.header_key_cursor = 0;
+                        } else {
+                            app.header_value_cursor = 0;
+                        }
+                    }
+                    _ => app.cursor_pos = 0,
+                }
+            }
+        }
+        Action::CursorEnd => {
+            if let Some(editing) = app.editing_field {
+                match editing {
+                    EditingField::Headers => {
+                        if app.editing_header_key {
+                            app.header_key_cursor = app.header_key_buffer.len();
+                        } else {
+                            app.header_value_cursor = app.header_value_buffer.len();
+                        }
+                    }
+                    _ => app.cursor_pos = app.input_buffer.len(),
                 }
             }
         }

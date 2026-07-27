@@ -76,8 +76,11 @@ pub struct App {
     pub editing_field: Option<EditingField>,
     pub focused_field: FocusableField,
     pub input_buffer: String,
+    pub cursor_pos: usize,
     pub header_key_buffer: String,
+    pub header_key_cursor: usize,
     pub header_value_buffer: String,
+    pub header_value_cursor: usize,
     pub editing_header_key: bool,
     pub editing_existing_header: Option<String>, // Original header key when editing
     pub selected_header_index: usize,
@@ -91,6 +94,9 @@ pub struct App {
     pub body_scroll: u16,
     pub events_scroll: u16,
     pub response_scroll: u16,
+    // Horizontal scroll for single-line editing fields
+    pub url_h_scroll: u16,
+    pub filter_h_scroll: u16,
     // Last save status message (shown briefly in the footer)
     pub last_save_status: Option<String>,
     // Keybinding map (single source of truth for dispatch + hints)
@@ -137,8 +143,11 @@ impl App {
             editing_field: None,
             focused_field: FocusableField::Url,
             input_buffer: String::new(),
+            cursor_pos: 0,
             header_key_buffer: String::new(),
+            header_key_cursor: 0,
             header_value_buffer: String::new(),
+            header_value_cursor: 0,
             editing_header_key: true,
             editing_existing_header: None,
             selected_header_index: 0,
@@ -149,6 +158,8 @@ impl App {
             body_scroll: 0,
             events_scroll: 0,
             response_scroll: 0,
+            url_h_scroll: 0,
+            filter_h_scroll: 0,
             streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),
@@ -950,12 +961,15 @@ impl App {
                 if let Some(request) = self.get_current_request() {
                     self.input_buffer = request.url.clone();
                 }
+                self.cursor_pos = self.input_buffer.len();
                 EditingField::Url
             }
             FocusableField::Headers => {
                 // Start adding a new header
                 self.header_key_buffer.clear();
+                self.header_key_cursor = 0;
                 self.header_value_buffer.clear();
+                self.header_value_cursor = 0;
                 self.editing_header_key = true;
                 self.editing_existing_header = None;
                 self.header_autocomplete_visible = true;
@@ -966,6 +980,7 @@ impl App {
                 if let Some(request) = self.get_current_request() {
                     self.input_buffer = request.body.clone().unwrap_or_default();
                 }
+                self.cursor_pos = self.input_buffer.len();
                 EditingField::Body
             }
             FocusableField::RequestEvents | FocusableField::Response => {
@@ -1010,7 +1025,9 @@ impl App {
         if let Some((key, value)) = header_data {
             self.editing_existing_header = Some(key.clone()); // Track original key
             self.header_key_buffer = key;
+            self.header_key_cursor = self.header_key_buffer.len();
             self.header_value_buffer = value;
+            self.header_value_cursor = self.header_value_buffer.len();
             self.editing_field = Some(EditingField::Headers);
             self.editing_header_key = true; // Start editing header name
             self.header_autocomplete_visible = true;
@@ -1071,8 +1088,11 @@ impl App {
         // Reset editing state
         self.editing_field = None;
         self.input_buffer.clear();
+        self.cursor_pos = 0;
         self.header_key_buffer.clear();
+        self.header_key_cursor = 0;
         self.header_value_buffer.clear();
+        self.header_value_cursor = 0;
         self.editing_header_key = true;
         self.editing_existing_header = None;
 
@@ -1084,6 +1104,8 @@ impl App {
         self.body_scroll = 0;
         self.events_scroll = 0;
         self.response_scroll = 0;
+        self.url_h_scroll = 0;
+        self.filter_h_scroll = 0;
 
         // Reset autocomplete
         self.header_autocomplete_visible = false;
@@ -1321,8 +1343,11 @@ mod tests {
             editing_field: None,
             focused_field: FocusableField::Url,
             input_buffer: String::new(),
+            cursor_pos: 0,
             header_key_buffer: String::new(),
+            header_key_cursor: 0,
             header_value_buffer: String::new(),
+            header_value_cursor: 0,
             editing_header_key: true,
             editing_existing_header: None,
             selected_header_index: 0,
@@ -1333,6 +1358,8 @@ mod tests {
             body_scroll: 0,
             events_scroll: 0,
             response_scroll: 0,
+            url_h_scroll: 0,
+            filter_h_scroll: 0,
             streamed_body_per: HashMap::new(),
             last_save_status: None,
             keymap: Keymap::default(),

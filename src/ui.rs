@@ -31,6 +31,51 @@ fn selected_item_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Returns the visual column of the cursor at the end of `text` after word-wrapping
+/// to `max_width`.  Mirrors ratatui's `Paragraph` with `Wrap { trim: false }`.
+fn wrapped_cursor_column(text: &str, max_width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+
+    if max_width == 0 || text.is_empty() {
+        return 0;
+    }
+
+    let mut col: u16 = 0;
+
+    for logical in text.split('\n') {
+        col = 0;
+        let mut is_ws = logical.starts_with(|c: char| c.is_whitespace());
+        let mut rest = logical;
+
+        while !rest.is_empty() {
+            let end = if is_ws {
+                rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len())
+            } else {
+                rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len())
+            };
+            let token = &rest[..end];
+            let tw = token.width() as u16;
+
+            if is_ws {
+                if col + tw <= max_width {
+                    col += tw;
+                }
+            } else if tw > max_width {
+                col = max_width;
+            } else if col + tw <= max_width {
+                col += tw;
+            } else {
+                col = tw;
+            }
+
+            rest = &rest[end..];
+            is_ws = !is_ws;
+        }
+    }
+
+    col.min(max_width)
+}
+
 // ── Layout / rendering helpers ────────────────────────────────────────────────
 
 /// Renders a scrollable, word-wrapped `Paragraph` with an optional vertical
@@ -318,10 +363,28 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         .title(url_title)
         .border_style(focused_border_style(is_url_focused));
 
-    let method_url = Paragraph::new(method_url_text)
-        .block(method_url_block)
-        .style(method_url_style);
-    frame.render_widget(method_url, left_chunks[0]);
+    if is_url_editing {
+        let inner = method_url_block.inner(left_chunks[0]);
+        let text_width = method_url_text.len() as u16;
+        let max_scroll = text_width.saturating_sub(inner.width);
+        let method_prefix = format!("{} ", request.method);
+        let cursor_visual = method_prefix.len() as u16 + app.cursor_pos as u16;
+        let h_scroll = cursor_visual
+            .saturating_sub(inner.width.saturating_sub(1))
+            .min(max_scroll);
+        let method_url = Paragraph::new(method_url_text)
+            .block(method_url_block)
+            .style(method_url_style)
+            .scroll((0, h_scroll));
+        frame.render_widget(method_url, left_chunks[0]);
+        let cx = left_chunks[0].left() + 1 + cursor_visual - h_scroll;
+        frame.set_cursor_position((cx, left_chunks[0].top() + 1));
+    } else {
+        let method_url = Paragraph::new(method_url_text)
+            .block(method_url_block)
+            .style(method_url_style);
+        frame.render_widget(method_url, left_chunks[0]);
+    }
 
     // ── Headers ───────────────────────────────────────────────────────────────
     let is_headers_focused = app.focused_field == FocusableField::Headers;
@@ -348,15 +411,45 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             .title(headers_title)
             .border_style(Style::default().fg(Color::Cyan));
 
-        let headers = Paragraph::new(lines.join("\n"))
+        let headers_text = lines.join("\n");
+        let headers_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let inner = headers_block.inner(left_chunks[1]);
+        let visible_lines = inner.height;
+        let line_count = Paragraph::new(headers_text.as_str())
+            .style(headers_style)
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width) as u16;
+        let max_scroll = line_count.saturating_sub(visible_lines);
+        let scroll = app.headers_scroll.min(max_scroll);
+        let headers_paragraph = Paragraph::new(headers_text)
             .block(headers_block)
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(headers, left_chunks[1]);
+            .style(headers_style)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(headers_paragraph, left_chunks[1]);
+        // Place cursor at the editing line
+        let cursor_col = if app.editing_header_key {
+            "Key: ".len() + app.header_key_cursor
+        } else {
+            "Value: ".len() + app.header_value_cursor
+        };
+        let cursor_row = inner.top() + (line_count - 1).saturating_sub(scroll);
+        if cursor_row <= inner.bottom() {
+            frame.set_cursor_position((
+                (inner.left() + cursor_col as u16).min(inner.right()),
+                cursor_row,
+            ));
+        }
+        if line_count > visible_lines {
+            let mut scrollbar_state =
+                ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"));
+            frame.render_stateful_widget(scrollbar, left_chunks[1], &mut scrollbar_state);
+        }
 
         if app.editing_header_key {
             let suggestions = app.get_filtered_header_suggestions();
@@ -424,6 +517,12 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         .title(body_title)
         .border_style(focused_border_style(is_body_focused));
 
+    let body_prefix = if is_body_editing {
+        Some(body_text[..app.cursor_pos].to_string())
+    } else {
+        None
+    };
+
     render_scrollable_paragraph(
         frame,
         body_text,
@@ -433,6 +532,34 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         &mut app.body_scroll,
         is_body_editing,
     );
+
+    if let Some(ref body_prefix) = body_prefix {
+        let content = Block::default()
+            .borders(Borders::ALL)
+            .inner(left_chunks[2]);
+        let inner_width = content.width.max(1);
+        // ratatui strips trailing newlines via str::lines(), so "hello\n" has
+        // line_count == 1 (not 2). Detect this and add the empty trailing line.
+        let ends_with_nl = body_prefix.ends_with('\n');
+        let prefix_for_count = if ends_with_nl {
+            &body_prefix[..body_prefix.len() - 1]
+        } else {
+            body_prefix.as_str()
+        };
+        let cursor_line_count = Paragraph::new(prefix_for_count)
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16
+            + if ends_with_nl { 1 } else { 0 };
+        let visible_lines = content.height;
+        app.body_scroll = app.body_scroll
+            .min(cursor_line_count.saturating_sub(1))
+            .max(cursor_line_count.saturating_sub(visible_lines));
+        let cursor_row = content.top() + cursor_line_count.saturating_sub(1) - app.body_scroll;
+        let col = if ends_with_nl { 0 } else { wrapped_cursor_column(body_prefix, inner_width) };
+        if cursor_row <= content.bottom() {
+            frame.set_cursor_position((content.left() + col, cursor_row));
+        }
+    }
 
     // ── Request Events ────────────────────────────────────────────────────────
     let is_events_focused = app.focused_field == FocusableField::RequestEvents;
@@ -613,10 +740,27 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::default().fg(Color::DarkGray)
             });
-        let filter_paragraph = Paragraph::new(filter_display)
-            .block(filter_block)
-            .style(filter_style);
-        frame.render_widget(filter_paragraph, response_chunks[1]);
+        if is_filter_editing {
+            let inner = filter_block.inner(response_chunks[1]);
+            let text_width = filter_display.len() as u16;
+            let max_scroll = text_width.saturating_sub(inner.width);
+            let cursor_visual = app.cursor_pos as u16;
+            let h_scroll = cursor_visual
+                .saturating_sub(inner.width.saturating_sub(1))
+                .min(max_scroll);
+            let filter_paragraph = Paragraph::new(filter_display)
+                .block(filter_block)
+                .style(filter_style)
+                .scroll((0, h_scroll));
+            frame.render_widget(filter_paragraph, response_chunks[1]);
+            let cx = response_chunks[1].left() + 1 + cursor_visual - h_scroll;
+            frame.set_cursor_position((cx, response_chunks[1].top() + 1));
+        } else {
+            let filter_paragraph = Paragraph::new(filter_display)
+                .block(filter_block)
+                .style(filter_style);
+            frame.render_widget(filter_paragraph, response_chunks[1]);
+        }
     } else if is_streamed_json_mode {
         // ── StreamedJson mode ─────────────────────────────────────────────────
         // Split: jq output on top, filter bar (3 fields) at bottom.
@@ -702,25 +846,44 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             );
         frame.render_widget(filter_bar_border, filter_area);
 
-        // Helper closure to build each filter row
-        let make_row =
-            |label: &str, value: &str, is_editing: bool, is_focused: bool| -> Paragraph {
-                let display = if is_editing {
-                    format!("{label}: {value} [EDITING]")
-                } else {
-                    format!("{label}: {value}")
-                };
-                let style = if is_editing {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else if is_focused {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                Paragraph::new(display).style(style)
+        fn render_row(
+            frame: &mut Frame,
+            label: &str,
+            value: &str,
+            is_editing: bool,
+            is_focused: bool,
+            area: Rect,
+            _h_scroll: u16,
+            cursor_pos: Option<usize>,
+        ) {
+            let display = if is_editing {
+                format!("{label}: {value} [EDITING]")
+            } else {
+                format!("{label}: {value}")
             };
+            let style = if is_editing {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if is_editing {
+                let cursor_visual = label.len() as u16 + 2 + cursor_pos.unwrap_or(0) as u16;
+                let text_width = display.len() as u16;
+                let visible_w = area.width.max(1);
+                let max_scroll = text_width.saturating_sub(visible_w);
+                let hs = cursor_visual.saturating_sub(visible_w - 1).min(max_scroll);
+                let p = Paragraph::new(display).style(style).scroll((0, hs));
+                frame.render_widget(p, area);
+                let cx = area.left() + cursor_visual - hs;
+                frame.set_cursor_position((cx, area.top()));
+            } else {
+                frame.render_widget(Paragraph::new(display).style(style), area);
+            }
+        }
 
         let prefix_val = if is_prefix_editing {
             app.input_buffer.clone()
@@ -738,27 +901,47 @@ fn render_request_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             app.current_jq_filter().to_string()
         };
 
-        frame.render_widget(
-            make_row(
-                "prefix",
-                &prefix_val,
-                is_prefix_editing,
-                is_response_focused,
-            ),
+        render_row(
+            frame,
+            "prefix",
+            &prefix_val,
+            is_prefix_editing,
+            is_response_focused,
             filter_rows[0],
+            app.filter_h_scroll,
+            if is_prefix_editing {
+                Some(app.cursor_pos)
+            } else {
+                None
+            },
         );
-        frame.render_widget(
-            make_row(
-                "suffix",
-                &suffix_val,
-                is_suffix_editing,
-                is_response_focused,
-            ),
+        render_row(
+            frame,
+            "suffix",
+            &suffix_val,
+            is_suffix_editing,
+            is_response_focused,
             filter_rows[1],
+            app.filter_h_scroll,
+            if is_suffix_editing {
+                Some(app.cursor_pos)
+            } else {
+                None
+            },
         );
-        frame.render_widget(
-            make_row("jq   ", &jq_val, is_filter_editing, is_response_focused),
+        render_row(
+            frame,
+            "jq   ",
+            &jq_val,
+            is_filter_editing,
+            is_response_focused,
             filter_rows[2],
+            app.filter_h_scroll,
+            if is_filter_editing {
+                Some(app.cursor_pos)
+            } else {
+                None
+            },
         );
     } else {
         // Plain text mode (or pending / no response)
@@ -1093,5 +1276,43 @@ mod tests {
     fn test_selected_item_style_is_bold() {
         let style = selected_item_style();
         assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // ── wrapped_cursor_column ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_wrapped_cursor_column_simple() {
+        assert_eq!(wrapped_cursor_column("hello", 10), 5);
+        assert_eq!(wrapped_cursor_column("", 10), 0);
+        assert_eq!(wrapped_cursor_column("  ", 10), 2);
+        assert_eq!(wrapped_cursor_column("  hello", 10), 7);
+    }
+
+    #[test]
+    fn test_wrapped_cursor_column_overflow() {
+        // "hello world" with width 10: "hello" line 1, "world" line 2
+        assert_eq!(wrapped_cursor_column("hello world", 10), 5);
+        // "hello world foo" with width 10: "hello" line 1, "world foo" line 2
+        assert_eq!(wrapped_cursor_column("hello world foo", 10), 9);
+        // "hello world foo bar" with width 10: "hello" l1, "world foo" l2 (flush at 9+1≥10), "bar" l3
+        assert_eq!(wrapped_cursor_column("hello world foo bar", 10), 3);
+    }
+
+    #[test]
+    fn test_wrapped_cursor_column_fits_on_one_line() {
+        assert_eq!(wrapped_cursor_column("hello world", 80), 11);
+        assert_eq!(wrapped_cursor_column("a b c d e f g", 80), 13);
+    }
+
+    #[test]
+    fn test_wrapped_cursor_column_long_word_exceeds_width() {
+        // Words longer than max_width are capped at max_width
+        assert_eq!(wrapped_cursor_column("abcdefghijklmnop", 5), 5);
+    }
+
+    #[test]
+    fn test_wrapped_cursor_column_newlines() {
+        assert_eq!(wrapped_cursor_column("hello\nworld", 80), 5);
+        assert_eq!(wrapped_cursor_column("hello\nworld\nfoo", 10), 3);
     }
 }

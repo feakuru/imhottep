@@ -68,6 +68,15 @@ pub enum Action {
     InsertNewline,
     SaveBody,
     DeleteChar,
+    DeleteNextChar,
+    DeleteWordBackward,
+    DeleteWordForward,
+    CursorLeft,
+    CursorRight,
+    CursorWordLeft,
+    CursorWordRight,
+    CursorHome,
+    CursorEnd,
     AutocompleteDown,
     AutocompleteUp,
 }
@@ -88,11 +97,9 @@ impl KeyTrigger {
             KeyTrigger::Char(c) => {
                 event.code == KeyCode::Char(*c) && event.modifiers == KeyModifiers::NONE
             }
-            // For non-character key codes (Enter, Esc, Tab, BackTab, arrows, etc.)
-            // we match on the code alone and ignore modifiers.  Crossterm encodes
-            // the shift semantics directly into the KeyCode (e.g. BackTab already
-            // implies Shift), so requiring NONE would break BackTab on most terminals.
-            KeyTrigger::Code(code) => event.code == *code,
+            KeyTrigger::Code(code) => {
+                event.code == *code && event.modifiers == KeyModifiers::NONE
+            }
             KeyTrigger::Modified(mods, code) => {
                 event.code == *code && event.modifiers.contains(*mods)
             }
@@ -661,12 +668,82 @@ impl Keymap {
             screen: CurrentScreen::Request,
             editing: Some(Some(EditingField::Url)),
             focus: None,
-            bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
-                action: Action::ConfirmEdit,
-                hint: "enter",
-                description: "confirm",
-            }],
+            bindings: vec![
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    action: Action::ConfirmEdit,
+                    hint: "enter",
+                    description: "confirm",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    action: Action::CursorLeft,
+                    hint: "←",
+                    description: "cursor left",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    action: Action::CursorRight,
+                    hint: "→",
+                    description: "cursor right",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
+                    ],
+                    action: Action::CursorWordLeft,
+                    hint: "^←/M←",
+                    description: "word left",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
+                    ],
+                    action: Action::CursorWordRight,
+                    hint: "^→/M→",
+                    description: "word right",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    action: Action::CursorHome,
+                    hint: "home",
+                    description: "line start",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    action: Action::CursorEnd,
+                    hint: "end",
+                    description: "line end",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    action: Action::DeleteNextChar,
+                    hint: "del",
+                    description: "delete next",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
+                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
+                    ],
+                    action: Action::DeleteWordBackward,
+                    hint: "^⌫/M⌫",
+                    description: "delete word",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
+                    ],
+                    action: Action::DeleteWordForward,
+                    hint: "^⌦/M⌦",
+                    description: "delete word forward",
+                },
+            ],
         });
 
         // Body editing
@@ -690,6 +767,74 @@ impl Keymap {
                     hint: "^S",
                     description: "save",
                 },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    action: Action::CursorLeft,
+                    hint: "←",
+                    description: "cursor left",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    action: Action::CursorRight,
+                    hint: "→",
+                    description: "cursor right",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
+                    ],
+                    action: Action::CursorWordLeft,
+                    hint: "^←/M←",
+                    description: "word left",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
+                    ],
+                    action: Action::CursorWordRight,
+                    hint: "^→/M→",
+                    description: "word right",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    action: Action::CursorHome,
+                    hint: "home",
+                    description: "line start",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    action: Action::CursorEnd,
+                    hint: "end",
+                    description: "line end",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    action: Action::DeleteNextChar,
+                    hint: "del",
+                    description: "delete next",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
+                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
+                    ],
+                    action: Action::DeleteWordBackward,
+                    hint: "^⌫/M⌫",
+                    description: "delete word",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
+                    ],
+                    action: Action::DeleteWordForward,
+                    hint: "^⌦/M⌦",
+                    description: "delete word forward",
+                },
             ],
         });
 
@@ -698,12 +843,82 @@ impl Keymap {
             screen: CurrentScreen::Request,
             editing: Some(Some(EditingField::JsonFilter)),
             focus: None,
-            bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
-                action: Action::ConfirmEdit,
-                hint: "enter",
-                description: "apply",
-            }],
+            bindings: vec![
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    action: Action::ConfirmEdit,
+                    hint: "enter",
+                    description: "apply",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    action: Action::CursorLeft,
+                    hint: "←",
+                    description: "cursor left",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    action: Action::CursorRight,
+                    hint: "→",
+                    description: "cursor right",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
+                    ],
+                    action: Action::CursorWordLeft,
+                    hint: "^←/M←",
+                    description: "word left",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
+                    ],
+                    action: Action::CursorWordRight,
+                    hint: "^→/M→",
+                    description: "word right",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    action: Action::CursorHome,
+                    hint: "home",
+                    description: "line start",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    action: Action::CursorEnd,
+                    hint: "end",
+                    description: "line end",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    action: Action::DeleteNextChar,
+                    hint: "del",
+                    description: "delete next",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
+                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
+                    ],
+                    action: Action::DeleteWordBackward,
+                    hint: "^⌫/M⌫",
+                    description: "delete word",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
+                    ],
+                    action: Action::DeleteWordForward,
+                    hint: "^⌦/M⌦",
+                    description: "delete word forward",
+                },
+            ],
         });
 
         // StreamPrefixRegex editing
@@ -711,12 +926,82 @@ impl Keymap {
             screen: CurrentScreen::Request,
             editing: Some(Some(EditingField::StreamPrefixRegex)),
             focus: None,
-            bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
-                action: Action::ConfirmEdit,
-                hint: "enter",
-                description: "apply",
-            }],
+            bindings: vec![
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    action: Action::ConfirmEdit,
+                    hint: "enter",
+                    description: "apply",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    action: Action::CursorLeft,
+                    hint: "←",
+                    description: "cursor left",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    action: Action::CursorRight,
+                    hint: "→",
+                    description: "cursor right",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
+                    ],
+                    action: Action::CursorWordLeft,
+                    hint: "^←/M←",
+                    description: "word left",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
+                    ],
+                    action: Action::CursorWordRight,
+                    hint: "^→/M→",
+                    description: "word right",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    action: Action::CursorHome,
+                    hint: "home",
+                    description: "line start",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    action: Action::CursorEnd,
+                    hint: "end",
+                    description: "line end",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    action: Action::DeleteNextChar,
+                    hint: "del",
+                    description: "delete next",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
+                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
+                    ],
+                    action: Action::DeleteWordBackward,
+                    hint: "^⌫/M⌫",
+                    description: "delete word",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
+                    ],
+                    action: Action::DeleteWordForward,
+                    hint: "^⌦/M⌦",
+                    description: "delete word forward",
+                },
+            ],
         });
 
         // StreamSuffixRegex editing
@@ -724,12 +1009,82 @@ impl Keymap {
             screen: CurrentScreen::Request,
             editing: Some(Some(EditingField::StreamSuffixRegex)),
             focus: None,
-            bindings: vec![Binding {
-                triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
-                action: Action::ConfirmEdit,
-                hint: "enter",
-                description: "apply",
-            }],
+            bindings: vec![
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Enter)],
+                    action: Action::ConfirmEdit,
+                    hint: "enter",
+                    description: "apply",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    action: Action::CursorLeft,
+                    hint: "←",
+                    description: "cursor left",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    action: Action::CursorRight,
+                    hint: "→",
+                    description: "cursor right",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
+                    ],
+                    action: Action::CursorWordLeft,
+                    hint: "^←/M←",
+                    description: "word left",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
+                    ],
+                    action: Action::CursorWordRight,
+                    hint: "^→/M→",
+                    description: "word right",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    action: Action::CursorHome,
+                    hint: "home",
+                    description: "line start",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    action: Action::CursorEnd,
+                    hint: "end",
+                    description: "line end",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    action: Action::DeleteNextChar,
+                    hint: "del",
+                    description: "delete next",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
+                        // Many terminals send Ctrl+Backspace as 0x08 (BS = Ctrl+H).
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
+                    ],
+                    action: Action::DeleteWordBackward,
+                    hint: "^⌫/M⌫",
+                    description: "delete word",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
+                    ],
+                    action: Action::DeleteWordForward,
+                    hint: "^⌦/M⌦",
+                    description: "delete word forward",
+                },
+            ],
         });
 
         // Headers editing
@@ -764,6 +1119,85 @@ impl Keymap {
                     action: Action::AutocompleteUp,
                     hint: "↑",
                     description: "prev suggestion",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Left)],
+                    action: Action::CursorLeft,
+                    hint: "←",
+                    description: "cursor left",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Right)],
+                    action: Action::CursorRight,
+                    hint: "→",
+                    description: "cursor right",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Left),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Left),
+                    ],
+                    action: Action::CursorWordLeft,
+                    hint: "^←/M←",
+                    description: "word left",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Right),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Right),
+                    ],
+                    action: Action::CursorWordRight,
+                    hint: "^→/M→",
+                    description: "word right",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Home)],
+                    action: Action::CursorHome,
+                    hint: "home",
+                    description: "line start",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::End)],
+                    action: Action::CursorEnd,
+                    hint: "end",
+                    description: "line end",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::Delete)],
+                    action: Action::DeleteNextChar,
+                    hint: "del",
+                    description: "delete next",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Backspace),
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Char('h')),
+                    ],
+                    action: Action::DeleteWordBackward,
+                    hint: "^⌫/M⌫",
+                    description: "delete word",
+                },
+                Binding {
+                    triggers: vec![
+                        KeyTrigger::Modified(KeyModifiers::CONTROL, KeyCode::Delete),
+                        KeyTrigger::Modified(KeyModifiers::ALT, KeyCode::Delete),
+                    ],
+                    action: Action::DeleteWordForward,
+                    hint: "^⌦/M⌦",
+                    description: "delete word forward",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::PageUp)],
+                    action: Action::ScrollUp,
+                    hint: "⇞",
+                    description: "scroll up",
+                },
+                Binding {
+                    triggers: vec![KeyTrigger::Code(KeyCode::PageDown)],
+                    action: Action::ScrollDown,
+                    hint: "⇟",
+                    description: "scroll down",
                 },
             ],
         });
