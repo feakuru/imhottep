@@ -38,7 +38,7 @@ You should never commit anything or change the git state in any other way unless
 ## Layout (Request screen)
 
 ```
-┌─ Method URL ─────────────────────────────────────┐
+┌─ Method URL ──────────────────────────────────────┐
 │ GET https://api.example.com                       │
 ├─ Headers ─────────────────────────────────────────┤
 │ Content-Type: application/json                    │
